@@ -1,0 +1,2924 @@
+/* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
+ * vi:set noexpandtab tabstop=8 shiftwidth=8:
+ *
+ * Copyright (c) 2024 Codethink Limited
+ * Copyright (c) 2024 GNOME Foundation
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include <config.h>
+#include <gio/gio.h>
+#include <glib.h>
+#include <glib/gi18n.h>
+#include <json-glib/json-glib.h>
+#include <malloc.h>
+#include <xmlb.h>
+
+#include <gnome-software.h>
+
+#include "gs-appstream.h"
+#include "gs-external-appstream-utils.h"
+#include "gs-metered.h"
+#include "gs-plugin-systemd-sysupdate.h"
+#include "gs-systemd-sysupdated-generated.h"
+
+/*
+ * Plugin to allow system updates using `systemd-sysupdated`.
+ *
+ * This plugin only works when systemd-sysupdated's org.freedesktop.sysupdate1
+ * D-Bus service is available on the system. For more information see the
+ * following links:
+ * - https://github.com/systemd/systemd/blob/main/docs/APPSTREAM_BUNDLE.md
+ * - https://github.com/systemd/systemd/blob/main/man/org.freedesktop.sysupdate1.xml
+ * - https://github.com/systemd/systemd/blob/main/man/systemd-sysupdated.service.xml
+ * - https://github.com/systemd/systemd/blob/main/man/systemd-sysupdate.xml
+ * - https://github.com/systemd/systemd/blob/main/man/sysupdate.d.xml
+ * - https://github.com/systemd/systemd/blob/main/man/sysupdate.features.xml
+ * - https://github.com/systemd/systemd/blob/main/man/updatectl.xml
+ *
+ * `systemd-sysupdated` provides a D-Bus interface, so this plugin runs
+ * asynchronously in the main thread, acting as a thin wrapper over that D-Bus
+ * interface. It doesn’t need to do any locking.
+ */
+
+#define FREEDESKTOP_DBUS_LIST_ACTIVATABLE_NAMES_TIMEOUT_MS (200)
+#define SYSUPDATED_JOB_CANCEL_TIMEOUT_MS (1000)
+#define SYSUPDATED_MANAGER_LIST_TARGET_TIMEOUT_MS (1000)
+#define SYSUPDATED_TARGET_CHECK_NEW_TIMEOUT_MS (10000)
+#define SYSUPDATED_TARGET_DESCRIBE_TIMEOUT_MS (10000)
+#define SYSUPDATED_TARGET_GET_APP_STREAM_TIMEOUT_MS (1000)
+#define SYSUPDATED_TARGET_GET_VERSION_TIMEOUT_MS (1000)
+#define SYSUPDATED_TARGET_ACQUIRE_TIMEOUT_MS (-1)
+#define SYSUPDATED_TARGET_INSTALL_TIMEOUT_MS (-1)
+
+/* See the org.freedesktop.sysupdate1 manual for a list of flags. */
+#define SYSUPDATED_TARGET_DESCRIBE_FLAGS_NONE ((guint64) 0)
+#define SYSUPDATED_TARGET_DESCRIBE_FLAGS_OFFLINE ((guint64) (1 << 0))
+#define SYSUPDATED_TARGET_ACQUIRE_FLAGS_NONE ((guint64) 0)
+#define SYSUPDATED_TARGET_INSTALL_FLAGS_NONE ((guint64) 0)
+
+/* Structure stores the `target` information reported by
+ * `systemd-sysupdated` */
+typedef struct {
+	GsSystemdSysupdateTarget *proxy;
+	gboolean is_valid;
+	gboolean is_installed;
+	gboolean is_pending;
+	gboolean is_partial;
+	gboolean is_incomplete;
+	gchar *id; /* (owned) (not nullable) */
+	gchar *class; /* (owned) (not nullable) */
+	gchar *name; /* (owned) (not nullable) */
+	gchar *object_path; /* (owned) (not nullable) */
+	gchar *current_version; /* (owned) (nullable) */
+	gchar *latest_version; /* (owned) (nullable) */
+	gchar *cache_hash; /* (owned) (nullable) */
+	gchar *xml_cache_kind; /* (owned) (nullable) */
+	GFile *xml_blob; /* (owned) (nullable) */
+	XbSilo *silo; /* (owned) (nullable) */
+} TargetItem;
+
+static TargetItem *
+target_item_new (const gchar *class, const gchar *name, const gchar *object_path)
+{
+	TargetItem *target = g_new0 (TargetItem, 1);
+	target->is_valid = TRUE; /* default to true on creation */
+	if (g_strcmp0 (class, "host") == 0) {
+		target->id = g_strdup ("host");
+	} else {
+		target->id = g_strdup_printf ("%s-%s", class, name);
+	}
+	target->class = g_strdup (class);
+	target->name = g_strdup (name);
+	target->object_path = g_strdup (object_path);
+	return target;
+}
+
+static void
+target_item_free (TargetItem *target)
+{
+	target->is_valid = FALSE;
+	g_clear_object (&target->proxy);
+	g_clear_pointer (&target->id, g_free);
+	g_clear_pointer (&target->class, g_free);
+	g_clear_pointer (&target->name, g_free);
+	g_clear_pointer (&target->object_path, g_free);
+	g_clear_pointer (&target->current_version, g_free);
+	g_clear_pointer (&target->latest_version, g_free);
+	g_clear_pointer (&target->cache_hash, g_free);
+	g_clear_pointer (&target->xml_cache_kind, g_free);
+	g_clear_object (&target->xml_blob);
+	g_clear_object (&target->silo);
+	g_free (target);
+}
+
+static const gchar *
+target_item_get_id (TargetItem *target)
+{
+	return target->id;
+}
+
+static gboolean
+target_item_is_pending (TargetItem *target)
+{
+	return target->latest_version && target->is_installed && target->is_pending && !target->is_partial && !target->is_incomplete;
+}
+
+static gboolean
+target_item_is_installed (TargetItem *target)
+{
+	return target->current_version || (target->latest_version && target->is_installed && !target->is_pending && !target->is_partial && !target->is_incomplete);
+}
+
+static gboolean
+target_item_is_updatable (TargetItem *target)
+{
+	/* To be updatable, there needs to be a latest version.
+	 * If that latest version pending/incomplete... we should "update".
+	 * If other case, if it is not already installed AND there is already a version installed (current), we should update.
+	 */
+	return target->latest_version && (target->is_pending || target->is_incomplete || target->is_partial || (target->current_version && !target->is_installed));
+}
+
+static gboolean
+target_item_matches_keywords (TargetItem         *target,
+                              const gchar *const *keywords)
+{
+	return g_strv_contains (keywords, "sysupdate") ||
+	       g_strv_contains (keywords, target->class) ||
+	       g_strv_contains (keywords, target->name);
+}
+
+static const gchar *
+target_item_get_cache_hash (TargetItem *target)
+{
+	if (target->cache_hash != NULL) {
+		return target->cache_hash;
+	}
+
+	target->cache_hash = g_compute_checksum_for_string (G_CHECKSUM_SHA1, target->object_path, -1);
+
+	/* This should never fail, as G_CHECKSUM_SHA1 is always supported by GLib */
+	g_assert (target->cache_hash != NULL);
+
+	return target->cache_hash;
+}
+
+static const gchar *
+target_item_get_xml_cache_kind (TargetItem *target,
+                                GsPlugin   *plugin)
+{
+	const gchar *cache_hash;
+
+	if (target->xml_cache_kind != NULL) {
+		return target->xml_cache_kind;
+	}
+
+	cache_hash = target_item_get_cache_hash (target);
+	target->xml_cache_kind = g_build_filename (gs_plugin_get_name (plugin), cache_hash, "xml", NULL);
+
+	return target->xml_cache_kind;
+}
+
+static GFile *
+target_item_get_xml_blob (TargetItem  *target,
+                          GsPlugin    *plugin,
+                          GError     **error)
+{
+	const gchar *cache_hash;
+	g_autofree gchar *cache_kind = NULL;
+	g_autofree gchar *xml_blob_path = NULL;
+
+	if (target->xml_blob != NULL) {
+		return target->xml_blob;
+	}
+
+	cache_hash = target_item_get_cache_hash (target);
+	cache_kind = g_build_filename (gs_plugin_get_name (plugin), cache_hash, NULL);
+	xml_blob_path = gs_utils_get_cache_filename (cache_kind,
+	                                             "components.xmlb",
+	                                             GS_UTILS_CACHE_FLAG_WRITEABLE | GS_UTILS_CACHE_FLAG_CREATE_DIRECTORY,
+	                                             error);
+	if (xml_blob_path == NULL) {
+		return NULL;
+	}
+
+	target->xml_blob = g_file_new_for_path (xml_blob_path);
+
+	return target->xml_blob;
+}
+
+static XbSilo *
+target_item_ensure_silo_for_appstream_paths (TargetItem    *target,
+                                             GsPlugin      *plugin,
+                                             GStrv          appstream_paths,
+                                             GCancellable  *cancellable,
+                                             GError       **error)
+{
+	GFile* xml_blob = NULL;
+	g_autoptr(XbBuilder) builder = NULL;
+	g_autoptr(XbSilo) silo = NULL;
+
+	builder = xb_builder_new ();
+
+	/* Verbose profiling. */
+	if (g_getenv ("GS_XMLB_VERBOSE") != NULL) {
+		xb_builder_set_profile_flags (builder,
+					      XB_SILO_PROFILE_FLAG_XPATH |
+					      XB_SILO_PROFILE_FLAG_DEBUG);
+	}
+
+	gs_appstream_add_current_locales (builder);
+
+	for (GStrv appstream_paths_l = appstream_paths; appstream_paths_l != NULL && *appstream_paths_l != NULL; appstream_paths_l++) {
+		g_autoptr(XbBuilderSource) source = NULL;
+		g_autoptr(GFile) appstream_file = NULL;
+		g_autoptr(XbBuilderNode) info = NULL;
+
+		source = xb_builder_source_new ();
+		appstream_file = g_file_new_for_path (*appstream_paths_l);
+		if (!xb_builder_source_load_file (source,
+		                                  appstream_file,
+		                                  XB_BUILDER_SOURCE_FLAG_WATCH_FILE | XB_BUILDER_SOURCE_FLAG_LITERAL_TEXT,
+		                                  cancellable,
+		                                  error)) {
+			return NULL;
+		}
+
+		/* Add metadata. */
+		info = xb_builder_node_insert (NULL, "info", NULL);
+		xb_builder_node_insert_text (info, "scope", as_component_scope_to_string (AS_COMPONENT_SCOPE_SYSTEM), NULL);
+		xb_builder_source_set_info (source, info);
+
+		xb_builder_import_source (builder, source);
+	}
+
+	/* Regenerate with each minor release. */
+	xb_builder_append_guid (builder, PACKAGE_VERSION);
+
+	xml_blob = target_item_get_xml_blob (target, plugin, error);
+	if (xml_blob == NULL) {
+		return NULL;
+	}
+
+	silo = xb_builder_ensure (builder, xml_blob,
+	                          XB_BUILDER_COMPILE_FLAG_IGNORE_INVALID | XB_BUILDER_COMPILE_FLAG_SINGLE_LANG,
+	                          cancellable,
+	                          error);
+#ifdef __GLIBC__
+	/* https://gitlab.gnome.org/GNOME/gnome-software/-/issues/941 
+	 * libxmlb <= 0.3.22 makes lots of temporary heap allocations parsing large XMLs
+	 * trim the heap after parsing to control RSS growth. */
+	malloc_trim (0);
+#endif
+
+	if (silo == NULL) {
+		return NULL;
+	}
+
+	g_clear_object (&target->silo);
+	target->silo = g_steal_pointer (&silo);
+
+	return target->silo;
+}
+
+/* Structure stores the `targets` whose information to be updated in
+ * queue and the current working `target` */
+typedef struct {
+	GQueue *queue; /* (owned) (not nullable) (element-type TargetItem) */
+	GsPluginRefreshMetadataFlags flags;
+} GsPluginSystemdSysupdateRefreshMetadataData;
+
+/* Takes ownership of @queue */
+static GsPluginSystemdSysupdateRefreshMetadataData *
+gs_plugin_systemd_sysupdate_refresh_metadata_data_new (GQueue                       *queue,
+                                                       GsPluginRefreshMetadataFlags  flags)
+{
+	GsPluginSystemdSysupdateRefreshMetadataData *data = g_new0 (GsPluginSystemdSysupdateRefreshMetadataData, 1);
+	data->queue = g_steal_pointer (&queue);
+	data->flags = flags;
+	return data;
+}
+
+static void
+gs_plugin_systemd_sysupdate_refresh_metadata_data_free (GsPluginSystemdSysupdateRefreshMetadataData *data)
+{
+	g_clear_pointer (&data->queue, g_queue_free);
+	data->flags = 0;
+	g_free (data);
+}
+
+/* Structure stores the `targets` whose information to be updated in
+ * queue and the current working `target` */
+typedef struct {
+	TargetItem *target;  /* (not owned) (nullable) */
+	GsPluginRefreshMetadataFlags flags;
+} GsPluginSystemdSysupdateTargetRefreshMetadataData;
+
+static GsPluginSystemdSysupdateTargetRefreshMetadataData *
+gs_plugin_systemd_sysupdate_target_refresh_metadata_data_new (TargetItem                   *target,
+                                                              GsPluginRefreshMetadataFlags  flags)
+{
+	GsPluginSystemdSysupdateTargetRefreshMetadataData *data = g_new0 (GsPluginSystemdSysupdateTargetRefreshMetadataData, 1);
+	data->target = target;
+	data->flags = flags;
+	return data;
+}
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_data_free (GsPluginSystemdSysupdateTargetRefreshMetadataData *data)
+{
+	data->target = NULL;
+	data->flags = 0;
+	g_free (data);
+}
+
+/* Structure stores the `targets` whose information to be refined in
+ * queue and the current working `target` */
+typedef struct {
+	GQueue *queue; /* (owned) (not nullable) (element-type TargetItem) */
+	GsPluginRefineFlags job_flags;
+	GsPluginRefineRequireFlags require_flags;
+} GsPluginSystemdSysupdateRefineData;
+
+static GsPluginSystemdSysupdateRefineData *
+gs_plugin_systemd_sysupdate_refine_data_new (GQueue                     *queue,
+                                             GsPluginRefineFlags         job_flags,
+                                             GsPluginRefineRequireFlags  require_flags)
+{
+	GsPluginSystemdSysupdateRefineData *data = g_new0 (GsPluginSystemdSysupdateRefineData, 1);
+	data->queue = g_steal_pointer (&queue);
+	data->job_flags = job_flags;
+	data->require_flags = require_flags;
+	return data;
+}
+
+static void
+gs_plugin_systemd_sysupdate_refine_data_free (GsPluginSystemdSysupdateRefineData *data)
+{
+	if (data->queue != NULL) {
+		g_queue_free_full (data->queue, g_object_unref);
+		data->queue = NULL;
+	}
+	data->job_flags = 0;
+	data->require_flags = 0;
+	g_free (data);
+}
+
+typedef struct {
+	GsApp *app; /* (owned) (not nullable) */
+} GsPluginSystemdSysupdateRefineAppData;
+
+static GsPluginSystemdSysupdateRefineAppData *
+gs_plugin_systemd_sysupdate_refine_app_data_new (GsApp *app)
+{
+	GsPluginSystemdSysupdateRefineAppData *data = g_new0 (GsPluginSystemdSysupdateRefineAppData, 1);
+	data->app = g_object_ref (app);
+	return data;
+}
+
+static void
+gs_plugin_systemd_sysupdate_refine_app_data_free (GsPluginSystemdSysupdateRefineAppData *data)
+{
+	g_clear_object (&data->app);
+	g_free (data);
+}
+
+/* Wrapper methods for async. target update
+ *
+ * The goal of the method `gs_plugin_systemd_sysupdate_update_apps_async()`
+ * is to wrap the specific target update as a single async. call, for each app.
+ * By design, there are two D-Bus method calls and two D-Bus signals
+ * involved in one app’s 'target update' progress:
+ *  1) D-Bus method `Target.Update()`
+ *  2) D-Bus method `Job.Cancel()`
+ *  3) D-Bus signal `Job.PropertiesChanged()`
+ *  4) D-Bus signal `Manager.JobRemoved()`
+ *
+ * Assumes there is only one job created dynamically in the runtime
+ * by `systemd-sysupdated` is associated to the `Target.Update()`.
+ * Here we create a subtask for each individual target update, and
+ * hide the 'target to job' mapping from the caller by maintaining
+ * the relationships internally within a look-up table. */
+typedef struct {
+	/* Input data. */
+	GsAppList *apps;  /* (owned) (not nullable) */
+	GsPluginUpdateAppsFlags flags;
+	GsPluginProgressCallback progress_callback;
+	gpointer progress_user_data;
+	GsPluginEventCallback event_callback;
+	void *event_user_data;
+	GsPluginAppNeedsUserActionCallback app_needs_user_action_callback;
+	gpointer app_needs_user_action_data;
+
+	/* In-progress data. */
+	GCancellable *cancellable;  /* (nullable) (not owned) */
+	unsigned long cancelled_id;
+
+	void *schedule_entry_handle;
+	guint current_update_app_index;
+} UpdateAppsData;
+
+static void
+update_apps_data_free (UpdateAppsData *data)
+{
+	if (data->cancellable != NULL && data->cancelled_id != 0)
+		g_cancellable_disconnect (data->cancellable, data->cancelled_id);
+	data->cancelled_id = 0;
+	data->cancellable = NULL;
+
+	/* All pending ops should have been completed by now. */
+	g_assert (data->schedule_entry_handle == NULL);
+	g_assert (data->current_update_app_index == gs_app_list_length (data->apps));
+
+	g_clear_object (&data->apps);
+
+	g_free (data);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (UpdateAppsData, update_apps_data_free)
+
+static void
+remove_schedule_entry (void *schedule_entry_handle)
+{
+	/* Fire this call off into the void, it’s not worth tracking it.
+	 * Don’t pass a cancellable in, as the download may have been cancelled. */
+	if (schedule_entry_handle != NULL)
+		gs_metered_remove_from_download_scheduler_async (schedule_entry_handle, NULL, NULL, NULL);
+}
+
+typedef struct {
+	GsApp *app; /* (owned) (not nullable) */
+	GsPluginUpdateAppsFlags flags;
+	GsSystemdSysupdateJob *current_job_proxy; /* (owned) (nullable); either contains the proxy for the Acquire() call or, later, the Install() call */
+	GsSystemdSysupdateTarget *target_proxy;  /* (owned) (nullable) */
+	char *target_path; /* (owned) (nullable) */
+	char *acquire_job_path; /* (owned) (nullable) */
+	char *install_job_path;  /* (owned) (nullable) */
+	const char *current_job_path;  /* (not owned) (nullable); points either to `acquire_job_path` or `install_job_path` */
+} UpdateAppData;
+
+static void
+update_app_data_free (UpdateAppData *data)
+{
+	g_clear_object (&data->app);
+	g_clear_object (&data->current_job_proxy);
+	g_clear_object (&data->target_proxy);
+	g_clear_pointer (&data->target_path, g_free);
+	g_clear_pointer (&data->acquire_job_path, g_free);
+	g_clear_pointer (&data->install_job_path, g_free);
+
+	g_free (data);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (UpdateAppData, update_app_data_free)
+
+/* Plugin object */
+struct _GsPluginSystemdSysupdate {
+	GsPlugin parent;
+
+	gchar *os_pretty_name; /* (owned) (not nullable) */
+	gchar *os_version; /* (owned) (not nullable) */
+
+	GsSystemdSysupdateManager *manager_proxy; /* (owned) (nullable) */
+	GHashTable *target_item_map; /* (owned) (not nullable) (element-type utf8 TargetItem) */
+	GHashTable *job_task_map; /* (owned) (not nullable) (element-type utf8 GTask) */
+	GHashTable *job_to_remove_status_map; /* (owned) (not nullable) (element-type utf8 int32) */
+	GHashTable *job_to_cancel_task_map; /* (owned) (not nullable) (element-type utf8 GTask) */
+	gboolean is_metadata_refresh_ongoing;
+	guint64 cache_age_secs;
+};
+
+/* Plugin private methods, and their callbacks. */
+
+static void gs_plugin_systemd_sysupdate_remove_job_apply (GsPluginSystemdSysupdate *self,
+                                                          GTask                    *task,
+                                                          const gchar              *job_path,
+                                                          gint32                    job_status);
+static void gs_plugin_systemd_sysupdate_cancel_job_cancel_cb (GObject      *source_object,
+                                                              GAsyncResult *result,
+                                                              gpointer      user_data);
+static void gs_plugin_systemd_sysupdate_cancel_job_cb (GObject      *source_object,
+                                                       GAsyncResult *result,
+                                                       gpointer      user_data);
+static void gs_plugin_systemd_sysupdate_cancel_job_revoke (GsPluginSystemdSysupdate *self,
+                                                           const gchar              *job_path);
+
+static void gs_plugin_systemd_sysupdate_update_app_proxy_new_cb (GObject      *source_object,
+                                                                 GAsyncResult *result,
+                                                                 gpointer      user_data);
+static void gs_plugin_systemd_sysupdate_update_app_acquire_cb (GObject      *source_object,
+                                                               GAsyncResult *result,
+                                                               gpointer      user_data);
+static void gs_plugin_systemd_sysupdate_update_app_install_cb (GObject      *source_object,
+                                                               GAsyncResult *result,
+                                                               gpointer      user_data);
+static void gs_plugin_systemd_sysupdate_update_app_job_proxy_new_cb (GObject      *source_object,
+                                                                     GAsyncResult *result,
+                                                                     gpointer      user_data);
+static void gs_plugin_systemd_sysupdate_update_app_notify_progress_cb (GObject    *object,
+                                                                       GParamSpec *pspec,
+                                                                       void       *user_data);
+
+/* Plugin overridden virtual methods, and their callbacks. */
+
+static void
+gs_plugin_systemd_sysupdate_setup_list_activatable_names_cb (GObject      *source_object,
+                                                             GAsyncResult *result,
+                                                             gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_setup_proxy_new_cb (GObject      *source_object,
+                                                GAsyncResult *result,
+                                                gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_refine_iter (GObject      *source_object,
+                                         GAsyncResult *result,
+                                         gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_refine_app_async (GsPlugin                   *plugin,
+                                              GsApp                      *app,
+                                              GsPluginRefineFlags         job_flags,
+                                              GsPluginRefineRequireFlags  require_flags,
+                                              GCancellable               *cancellable,
+                                              GAsyncReadyCallback         callback,
+                                              gpointer                    user_data);
+
+static void
+gs_plugin_systemd_sysupdate_refine_app_proxy_new_cb (GObject      *source_object,
+                                                 GAsyncResult *result,
+                                                 gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_refine_app_describe_cb (GObject      *source_object,
+                                                GAsyncResult *result,
+                                                gpointer      user_data);
+
+static gboolean
+gs_plugin_systemd_sysupdate_refine_app_finish (GsPlugin      *plugin,
+                                               GAsyncResult  *result,
+                                               GError       **error);
+
+static void
+gs_plugin_systemd_sysupdate_refresh_metadata_list_targets_cb (GObject      *source_object,
+                                                              GAsyncResult *result,
+                                                              gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_refresh_metadata_iter (GObject      *source_object,
+                                                   GAsyncResult *result,
+                                                   gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_async (GsPlugin                     *plugin,
+                                                           TargetItem                   *target,
+                                                           GsPluginRefreshMetadataFlags  flags,
+                                                           GCancellable                 *cancellable,
+                                                           GAsyncReadyCallback           callback,
+                                                           gpointer                      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_proxy_new_cb (GObject      *source_object,
+                                                                  GAsyncResult *result,
+                                                                  gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_get_app_stream_cb (GObject      *source_object,
+                                                                       GAsyncResult *result,
+                                                                       gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_external_appstream_refresh_cb (GObject      *source_object,
+                                                                                   GAsyncResult *result,
+                                                                                   gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_get_version_cb (GObject      *source_object,
+                                                                    GAsyncResult *result,
+                                                                    gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_check_new_cb (GObject      *source_object,
+                                                                  GAsyncResult *result,
+                                                                  gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_describe_cb (GObject      *source_object,
+								 GAsyncResult *result,
+								 gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_done (GsPluginSystemdSysupdate *self,
+							  GTask *task,
+							  GsPluginSystemdSysupdateTargetRefreshMetadataData *data);
+
+static gboolean
+gs_plugin_systemd_sysupdate_target_refresh_metadata_finish (GsPlugin      *plugin,
+                                                            GAsyncResult  *result,
+                                                            GError       **error);
+static void
+gs_plugin_systemd_sysupdate_update_apps_download_scheduler_cb (GObject      *source_object,
+                                                               GAsyncResult *result,
+                                                               gpointer      user_data);
+static void
+gs_plugin_systemd_sysupdate_update_apps_iter (GObject      *source_object,
+                                              GAsyncResult *result,
+                                              gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_update_app_async (GsPluginSystemdSysupdate           *self,
+                                              GsApp                              *app,
+                                              GsPluginUpdateAppsFlags             flags,
+                                              GsPluginProgressCallback            progress_callback,
+                                              gpointer                            progress_user_data,
+                                              GsPluginAppNeedsUserActionCallback  app_needs_user_action_callback,
+                                              gpointer                            app_needs_user_action_data,
+                                              GCancellable                       *cancellable,
+                                              GAsyncReadyCallback                 callback,
+                                              gpointer                            user_data);
+
+static gboolean
+gs_plugin_systemd_sysupdate_update_app_finish (GsPlugin      *plugin,
+                                               GAsyncResult  *result,
+                                               GError       **error);
+
+G_DEFINE_TYPE (GsPluginSystemdSysupdate, gs_plugin_systemd_sysupdate, GS_TYPE_PLUGIN)
+
+static TargetItem *
+lookup_target_by_app (GsPluginSystemdSysupdate *self,
+                      GsApp                    *app)
+{
+	/* Helper to get the associated `target` of the given `app`
+	 */
+	return g_hash_table_lookup (self->target_item_map, gs_app_get_metadata_item (app, "SystemdSysupdated::Target"));
+}
+
+static GsApp *
+create_app_for_target_appstream (GsPluginSystemdSysupdate  *self,
+                                 TargetItem                *target,
+                                 GError                   **error)
+{
+	GsPlugin *plugin = GS_PLUGIN (self);
+	g_autoptr(XbNode) component = NULL;
+	g_autoptr(XbNode) info_filename = NULL;
+	const gchar *silo_filename = NULL;
+	g_autoptr(GsApp) app = NULL;
+	g_autoptr(GError) local_error = NULL;
+
+	if (target->silo == NULL) {
+		g_set_error_literal (error,
+		                     GS_PLUGIN_ERROR,
+		                     GS_PLUGIN_ERROR_INVALID_FORMAT,
+		                     "No metadata available");
+		return NULL;
+	}
+
+	component = xb_silo_query_first (target->silo, "/component", NULL);
+	if (component == NULL) {
+		g_set_error_literal (error,
+		                     GS_PLUGIN_ERROR,
+		                     GS_PLUGIN_ERROR_INVALID_FORMAT,
+		                     "No component available in metadata");
+		return NULL;
+	}
+
+	info_filename = xb_silo_query_first (target->silo, "/info/filename", NULL);
+	if (info_filename != NULL) {
+		silo_filename = xb_node_get_text (info_filename);
+	}
+
+	if (silo_filename == NULL) {
+		silo_filename = "";
+	}
+
+	app = gs_appstream_create_app (plugin, target->silo, component, silo_filename, AS_COMPONENT_SCOPE_SYSTEM, &local_error);
+	if (local_error != NULL) {
+		g_propagate_error (error, g_steal_pointer (&local_error));
+		return NULL;
+	} else if (app == NULL) {
+		g_set_error_literal (error,
+		                     GS_PLUGIN_ERROR,
+		                     GS_PLUGIN_ERROR_FAILED,
+		                     "Couldn't create an application via appstream");
+		return NULL;
+	}
+
+	/* store target name to look up target info. */
+	gs_app_set_metadata (app, "SystemdSysupdated::Target", target->name);
+	gs_app_set_metadata (app, "SystemdSysupdated::Class", target->class);
+
+	/* own the app we created */
+	gs_app_set_management_plugin (app, plugin);
+
+	return g_steal_pointer (&app);
+}
+
+static GsApp *
+create_app_for_target_fallback (GsPluginSystemdSysupdate  *self,
+                                TargetItem                *target,
+                                GError                   **error)
+{
+	/* Create an app upgrade (os-upgrade) for the target `host` or an app
+	 * update for the target `component`
+	 */
+	g_autoptr(GsApp) app = NULL;
+	g_autofree gchar *app_id = NULL;
+	const gchar *app_name = NULL;
+#if AS_CHECK_VERSION(1, 0, 4)
+	AsBundleKind bundle_kind = AS_BUNDLE_KIND_SYSUPDATE;
+#else
+	AsBundleKind bundle_kind = AS_BUNDLE_KIND_UNKNOWN;
+#endif
+	const gchar *app_summary = NULL;
+	GsAppQuirk app_quirk = GS_APP_QUIRK_NEEDS_REBOOT
+	                     | GS_APP_QUIRK_PROVENANCE
+	                     | GS_APP_QUIRK_NOT_REVIEWABLE;
+
+	if (g_strcmp0 (target->class, "host") == 0) {
+		app_name = self->os_pretty_name;
+#if !AS_CHECK_VERSION(1, 0, 4)
+		bundle_kind = AS_BUNDLE_KIND_PACKAGE;
+#endif
+		/* TRANSLATORS: this is the system OS upgrade */
+		app_summary = _("System");
+	} else if (g_strcmp0 (target->class, "component") == 0) {
+		app_name = target_item_get_id (target);
+		/* TRANSLATORS: this is the system component update */
+		app_summary = _("System component");
+		app_quirk |= GS_APP_QUIRK_COMPULSORY;
+	} else {
+		g_set_error (error,
+		             GS_PLUGIN_ERROR,
+		             GS_PLUGIN_ERROR_NOT_SUPPORTED,
+		             "Unsupported target class `%s`",
+		             target->class);
+		return NULL;
+	}
+
+	app_id = g_strdup_printf ("%s.%s",
+	                          gs_plugin_get_name (GS_PLUGIN (self)),
+	                          target_item_get_id (target));
+
+	/* We explicitly don't set the license as we don't have it with the
+	 * current version of the sysupdate D-Bus API.
+	 */
+	app = gs_app_new (app_id);
+	gs_app_set_name (app, GS_APP_QUALITY_LOWEST, app_name);
+	gs_app_set_scope (app, AS_COMPONENT_SCOPE_SYSTEM);
+	gs_app_set_kind (app, AS_COMPONENT_KIND_OPERATING_SYSTEM);
+	gs_app_set_bundle_kind (app, bundle_kind);
+	gs_app_set_summary (app, GS_APP_QUALITY_LOWEST, app_summary);
+	gs_app_set_size_installed (app, GS_SIZE_TYPE_UNKNOWABLE, 0);
+	gs_app_set_size_download (app, GS_SIZE_TYPE_UNKNOWABLE, 0);
+	gs_app_set_state (app, GS_APP_STATE_UNKNOWN);
+	gs_app_set_progress (app, GS_APP_PROGRESS_UNKNOWN);
+	gs_app_set_allow_cancel (app, TRUE);
+
+	/* store target name to look up target info. */
+	gs_app_set_metadata (app, "SystemdSysupdated::Target", target->name);
+	gs_app_set_metadata (app, "SystemdSysupdated::Class", target->class);
+
+	gs_app_add_quirk (app, app_quirk);
+
+	/* own the app we created */
+	gs_app_set_management_plugin (app, GS_PLUGIN (self));
+
+	/* store app to the per-plugin cache */
+	gs_plugin_cache_add (GS_PLUGIN (self), target_item_get_id (target), app);
+
+	return g_steal_pointer (&app);
+}
+
+static GsApp *
+create_app_for_target (GsPluginSystemdSysupdate  *self,
+                       TargetItem                *target,
+                       GError                   **error)
+{
+	/* Valid metadata are required for all but the host target. If we can't
+	 * create an application from the appstream metainfo, we create a
+	 * fallback application to avoid blocking host updates. */
+	if (g_strcmp0 (target->class, "host") == 0) {
+		g_autoptr(GsApp) app = NULL;
+		g_autoptr(GError) local_error = NULL;
+
+		app = create_app_for_target_appstream (self, target, &local_error);
+		if (app != NULL) {
+			return g_steal_pointer (&app);
+		}
+
+		g_debug ("Couldn't create app for host target, creating fallback: %s", local_error->message);
+
+		return create_app_for_target_fallback (self, target, error);
+	} else if (g_strcmp0 (target->class, "component") == 0) {
+		return create_app_for_target_appstream (self, target, error);
+	} else {
+		g_set_error (error,
+		             GS_PLUGIN_ERROR,
+		             GS_PLUGIN_ERROR_NOT_SUPPORTED,
+		             "Unsupported target class `%s`",
+		             target->class);
+		return NULL;
+	}
+}
+
+static GsApp *
+get_or_create_app_for_target (GsPluginSystemdSysupdate  *self,
+                              TargetItem                *target,
+                              GError                   **error)
+{
+	/* Get or create an app when there is no existing one in cache
+	 * for the given target */
+
+	g_autoptr(GsApp) app = NULL;
+
+	/* find in the per-plugin cache */
+	app = gs_plugin_cache_lookup (GS_PLUGIN (self), target_item_get_id (target));
+	if (app != NULL) {
+		return g_steal_pointer (&app);
+	}
+
+	return create_app_for_target (self, target, error);
+}
+
+/* This plugin explicitly only allows updating already installed targets. It is
+ * expected for targets to be installed through other means. */
+static void
+update_app_for_target (GsPluginSystemdSysupdate *self,
+                       GsApp                    *app,
+                       TargetItem               *target)
+{
+	const gchar *app_version = NULL;
+	GsAppState app_state = GS_APP_STATE_UNKNOWN;
+	GsSizeType size_type = GS_SIZE_TYPE_UNKNOWN;
+
+	if (target_item_is_pending (target)) {
+		app_version = target->latest_version;
+		app_state = GS_APP_STATE_UPDATABLE_LIVE;
+		size_type = GS_SIZE_TYPE_VALID;
+	} else if (target_item_is_updatable (target)) {
+		app_version = target->latest_version;
+		app_state = GS_APP_STATE_UPDATABLE_LIVE;
+		size_type = GS_SIZE_TYPE_UNKNOWABLE;
+	} else if (target_item_is_installed (target)) {
+		if (g_strcmp0 (target->class, "host") == 0) {
+			app_version = self->os_version;
+		} else {
+			app_version = target->current_version;
+		}
+		app_state = GS_APP_STATE_INSTALLED;
+		size_type = GS_SIZE_TYPE_VALID;
+	}
+
+	gs_app_set_version (app, app_version);
+	gs_app_set_state (app, app_state);
+	gs_app_set_size_download (app, size_type, 0);
+}
+
+/* Remove the given job. It is called when the server notified us a job
+ * terminated.
+ *
+ * Because of the async nature of of the application, we can receive job removal
+ * notifications from the server after we requested the update jobs but before
+ * we finished preparing them. To handle job removal notifications correctly, we
+ * may need to store them until we are ready. */
+static void
+gs_plugin_systemd_sysupdate_remove_job (GsPluginSystemdSysupdate *self,
+                                        const gchar              *job_path,
+                                        gint32                    job_status)
+{
+	GTask *task = NULL;
+
+	if (g_hash_table_contains (self->job_to_remove_status_map, job_path)) {
+		g_debug ("Job already filed for removal: %s", job_path);
+		return;
+	}
+
+	task = g_hash_table_lookup (self->job_task_map, job_path);
+	if (task == NULL) {
+		g_debug ("Couldn´t remove task for job `%s`, no task found, storing for later removal", job_path);
+		g_hash_table_insert (self->job_to_remove_status_map, g_strdup (job_path), GINT_TO_POINTER (job_status));
+		/* The job terminated, there is nothing to cancel anymore. */
+		gs_plugin_systemd_sysupdate_cancel_job_revoke (self, job_path);
+		return;
+	}
+
+	gs_plugin_systemd_sysupdate_remove_job_apply (self, task, job_path, job_status);
+}
+
+static void
+gs_plugin_systemd_sysupdate_remove_job_apply (GsPluginSystemdSysupdate *self,
+                                              GTask                    *task,
+                                              const gchar              *job_path,
+                                              gint32                    job_status)
+{
+	g_autoptr(GTask) task_owned = NULL;
+	UpdateAppData *data = g_task_get_task_data (task);
+	const gchar *target_class = NULL;
+	gboolean target_is_host = FALSE;
+	gboolean job_is_acquire;
+
+	/* Take a ref on the task for the duration of this function, as we may
+	 * drop the last other strong ref to it when removing it from the hash maps */
+	task_owned = g_object_ref (task);
+
+	g_debug ("Removing task found for job `%s`", job_path);
+	/* pass the parameters to the callback */
+	target_class = gs_app_get_metadata_item (data->app, "SystemdSysupdated::Class");
+	target_is_host = g_strcmp0 (target_class, "host") == 0;
+	job_is_acquire = (data->acquire_job_path != NULL && g_str_equal (data->acquire_job_path, job_path));
+
+	/* The `systemd-sysupdate` job returns zero on success, any other number
+	 * represents a failure. A positive number is an exit code, and a
+	 * negative number is an errno code that gives us more information about
+	 * the failure. */
+	if (job_status == 0 && job_is_acquire) {
+		/* Successful end of the Acquire() job */
+		gs_app_set_state (data->app, GS_APP_STATE_UPDATABLE_LIVE);
+		gs_app_set_size_download (data->app, GS_SIZE_TYPE_VALID, 0);
+	} else if (job_status == 0) {
+		/* Successful end of the Install() job */
+		gs_app_set_progress (data->app, GS_APP_PROGRESS_UNKNOWN);
+		/* The `host` target should have its state left as `updatable`. */
+		if (target_is_host) {
+			gs_app_set_state (data->app, GS_APP_STATE_UPDATABLE_LIVE);
+			gs_app_set_size_download (data->app, GS_SIZE_TYPE_VALID, 0);
+		} else {
+			gs_app_set_state (data->app, GS_APP_STATE_INSTALLED);
+		}
+	} else if (job_status != 0) {
+		gs_app_set_progress (data->app, GS_APP_PROGRESS_UNKNOWN);
+		/* The `host` target has the non-transient `updatable` state, so
+		 * to recover back to the `available` state, we have to set it
+		 * explicitly. */
+		if (target_is_host) {
+			gs_app_set_state (data->app, GS_APP_STATE_AVAILABLE);
+		} else {
+			gs_app_set_state_recover (data->app);
+		}
+	}
+
+	/* Remove task from the hashmaps */
+	g_hash_table_remove (self->job_task_map, job_path);
+	g_hash_table_remove (self->job_to_remove_status_map, job_path);
+	/* The job terminated, there is nothing to cancel anymore. */
+	gs_plugin_systemd_sysupdate_cancel_job_revoke (self, job_path);
+
+	/* If the job was to Acquire() a Target, and was successful, we now
+	 * want to Install() it. */
+	if (job_status == 0 &&
+	    job_is_acquire &&
+	    data->install_job_path == NULL &&
+	    !(data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY)) {
+		GDBusCallFlags call_flags = G_DBUS_CALL_FLAGS_NONE;
+
+		if (data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE) {
+			call_flags |= G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION;
+		}
+
+		gs_app_set_state (data->app, GS_APP_STATE_INSTALLING);
+
+		gs_systemd_sysupdate_target_call_install (data->target_proxy,
+		                                          "", /* left empty as the latest version */
+		                                          SYSUPDATED_TARGET_INSTALL_FLAGS_NONE,
+		                                          call_flags,
+		                                          SYSUPDATED_TARGET_INSTALL_TIMEOUT_MS,
+		                                          NULL, /* Makes the call explicitly non-cancellable so we can get the job path and cancel it correctly. */
+		                                          gs_plugin_systemd_sysupdate_update_app_install_cb,
+		                                          g_object_ref (task));
+		return;
+	}
+
+	/* Return the job status */
+	if (job_status == 0) {
+		g_task_return_boolean (task, TRUE);
+	} else {
+		g_task_return_new_error (task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         _("Removing sysupdate job '%s' failed with status %i"),
+		                         job_path, job_status);
+	}
+}
+
+static void
+gs_plugin_systemd_sysupdate_remove_job_revoke (GsPluginSystemdSysupdate *self,
+                                               const gchar              *job_path)
+{
+	g_hash_table_remove (self->job_to_remove_status_map, job_path);
+}
+
+/* Request systemd-sysupdate to cancel the given job. It is called when the
+ * plugin's update job has been cancelled.
+ *
+ * Because of the async nature of the application, we can receive job
+ * cancellation requests from the application after we requested the update jobs
+ * but before we finished preparing them. To handle job cancellation requests
+ * correctly, we may need to store them until we are ready. */
+static void
+gs_plugin_systemd_sysupdate_cancel_job (GsPluginSystemdSysupdate *self,
+                                        GsApp                    *app,
+                                        gboolean                  interactive)
+{
+	TargetItem *target = NULL;
+	const gchar *job_path = NULL;
+	GHashTableIter iter;
+	gpointer key;
+	gpointer value;
+	g_autoptr(GCancellable) cancellable = NULL;
+	g_autoptr(GTask) task = NULL;
+	GTask *update_task = NULL;
+	UpdateAppData *update_data = NULL;
+	GDBusCallFlags call_flags = G_DBUS_CALL_FLAGS_NONE;
+
+	target = lookup_target_by_app (self, app);
+	if (target == NULL) {
+		g_debug ("Couldn´t cancel the update: no target found");
+		return;
+	}
+
+	/* iterate over the on-going tasks to find the job */
+	g_hash_table_iter_init (&iter, self->job_task_map);
+	while (g_hash_table_iter_next (&iter, &key, &value)) {
+		UpdateAppData *job_data = g_task_get_task_data (value);
+		if (job_data != NULL &&
+		    g_strcmp0 (job_data->target_path, target->object_path) == 0) {
+			job_path = key;
+			update_task = G_TASK (value);
+			break;
+		}
+	}
+	if (job_path == NULL) {
+		g_debug ("Couldn´t cancel the update: no job found for target `%s`", target->object_path);
+		return;
+	}
+
+	if (g_hash_table_contains (self->job_to_cancel_task_map, job_path)) {
+		g_debug ("Job already filed for cancellation: %s", job_path);
+		return;
+	}
+
+	if (g_hash_table_contains (self->job_to_remove_status_map, job_path)) {
+		g_debug ("Job already filed for removal: %s", job_path);
+		return;
+	}
+
+	cancellable = g_cancellable_new ();
+	task = g_task_new (self, cancellable, gs_plugin_systemd_sysupdate_cancel_job_cb, NULL);
+	g_task_set_source_tag (task, gs_plugin_systemd_sysupdate_cancel_job);
+	g_task_set_task_data (task, g_strdup (job_path), (GDestroyNotify)g_free);
+
+	if (update_task == NULL) {
+		g_debug ("Couldn´t cancel task for job `%s`, no task found, storing for later cancellation", job_path);
+		g_hash_table_insert (self->job_to_cancel_task_map, g_strdup (job_path), g_steal_pointer (&task));
+		return;
+	}
+
+	update_data = g_task_get_task_data (update_task);
+
+	if (update_data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE) {
+		call_flags |= G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION;
+	}
+
+	gs_systemd_sysupdate_job_call_cancel (update_data->current_job_proxy,
+	                                      call_flags,
+	                                      SYSUPDATED_JOB_CANCEL_TIMEOUT_MS,
+	                                      cancellable,
+	                                      gs_plugin_systemd_sysupdate_cancel_job_cancel_cb,
+	                                      g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_systemd_sysupdate_cancel_job_cancel_cb (GObject      *source_object,
+                                                  GAsyncResult *result,
+                                                  gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+
+	if (!gs_systemd_sysupdate_job_call_cancel_finish (GS_SYSTEMD_SYSUPDATE_JOB (source_object),
+	                                                  result,
+	                                                  &local_error)) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	if (g_task_return_error_if_cancelled (task)) {
+		return;
+	}
+
+	g_task_return_boolean (task, TRUE);
+}
+
+static void
+gs_plugin_systemd_sysupdate_cancel_job_cb (GObject      *source_object,
+                                           GAsyncResult *result,
+                                           gpointer      user_data)
+{
+	GTask *task = G_TASK (result);
+	const gchar *job_path = NULL;
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	g_autoptr(GError) local_error = NULL;
+
+	job_path = g_task_get_task_data (task);
+	g_hash_table_remove (self->job_to_cancel_task_map, job_path);
+
+	if (!g_task_propagate_boolean (task, &local_error)) {
+		g_debug ("Couldn´t cancel the update: %s", local_error->message);
+		return;
+	}
+
+	g_debug ("Cancelled update job `%s` successfully", job_path);
+}
+
+static void
+gs_plugin_systemd_sysupdate_cancel_job_revoke (GsPluginSystemdSysupdate *self,
+                                               const gchar              *job_path)
+{
+	GTask *task = NULL;
+	GCancellable *cancellable = NULL;
+
+	task = G_TASK (g_hash_table_lookup (self->job_to_cancel_task_map, job_path));
+	if (!task) {
+		return;
+	}
+
+	cancellable = g_task_get_cancellable (task);
+	if (!cancellable) {
+		return;
+	}
+
+	g_cancellable_cancel (cancellable);
+}
+
+/* Plugin methods */
+static void
+gs_plugin_systemd_sysupdate_init (GsPluginSystemdSysupdate *self)
+{
+	self->target_item_map = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify)target_item_free);
+	self->job_task_map = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_object_unref);
+	self->job_to_remove_status_map = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify)NULL);
+	self->job_to_cancel_task_map = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_object_unref);
+}
+
+static void
+gs_plugin_systemd_sysupdate_dispose (GObject *object)
+{
+	GsPluginSystemdSysupdate *self = GS_PLUGIN_SYSTEMD_SYSUPDATE (object);
+
+	g_clear_object (&self->manager_proxy);
+
+	G_OBJECT_CLASS (gs_plugin_systemd_sysupdate_parent_class)->dispose (object);
+}
+
+static void
+gs_plugin_systemd_sysupdate_finalize (GObject *object)
+{
+	GsPluginSystemdSysupdate *self = GS_PLUGIN_SYSTEMD_SYSUPDATE (object);
+
+	/* These should all have been emptied by now; if not, something is wrong. */
+	g_assert (g_hash_table_size (self->job_task_map) == 0);
+	g_assert (g_hash_table_size (self->job_to_remove_status_map) == 0);
+	g_assert (g_hash_table_size (self->job_to_cancel_task_map) == 0);
+
+	g_clear_pointer (&self->os_pretty_name, g_free);
+	g_clear_pointer (&self->os_version, g_free);
+	g_clear_pointer (&self->target_item_map, g_hash_table_destroy);
+	g_clear_pointer (&self->job_task_map, g_hash_table_destroy);
+	g_clear_pointer (&self->job_to_remove_status_map, g_hash_table_destroy);
+	g_clear_pointer (&self->job_to_cancel_task_map, g_hash_table_destroy);
+	self->is_metadata_refresh_ongoing = FALSE;
+	self->cache_age_secs = 0;
+
+	G_OBJECT_CLASS (gs_plugin_systemd_sysupdate_parent_class)->finalize (object);
+}
+
+static void
+gs_plugin_systemd_sysupdate_error_convert (GError **perror)
+{
+	GError *error = (perror != NULL) ? *perror : NULL;
+
+	if (error == NULL)
+		return;
+
+	/* parse remote systemd-sysupdated error */
+	if (g_dbus_error_is_remote_error (error)) {
+		g_autofree char *remote_error = g_dbus_error_get_remote_error (error);
+
+		g_dbus_error_strip_remote_error (error);
+
+		if (g_str_equal (remote_error, "org.freedesktop.DBus.Error.InvalidArgs") ||
+		    g_str_equal (remote_error, "org.freedesktop.DBus.Error.Failed") ||
+		    g_str_equal (remote_error, "org.freedesktop.DBus.Error.NoMemory")) {
+			error->code = GS_PLUGIN_ERROR_FAILED;
+		} else if (g_str_equal (remote_error, "org.freedesktop.DBus.Error.AccessDenied")) {
+			error->code = GS_PLUGIN_ERROR_NO_SECURITY;
+		} else if (g_str_equal (remote_error, "org.freedesktop.DBus.Error.ObjectPathInUse")) {
+			/* FIXME: This error means we’re racing with another caller
+			 * on the sysupdated methods. We could probably handle this
+			 * better by monitoring and retrying later rather than
+			 * erroring out. */
+			error->code = GS_PLUGIN_ERROR_FAILED;
+		} else if (g_str_equal (remote_error, "org.freedesktop.DBus.Error.ServiceUnknown")) {
+			error->code = GS_PLUGIN_ERROR_NOT_SUPPORTED;
+		} else {
+			g_warning ("Can’t reliably fixup remote error ‘%s’", remote_error);
+			error->code = GS_PLUGIN_ERROR_FAILED;
+		}
+		error->domain = GS_PLUGIN_ERROR;
+		return;
+	}
+
+	/* these are allowed for low-level errors */
+	if (gs_utils_error_convert_gio (perror))
+		return;
+
+	/* most errors will be D-Bus errors */
+	if (gs_utils_error_convert_gdbus (perror))
+		return;
+}
+
+static void
+gs_plugin_systemd_sysupdate_setup_async (GsPlugin            *plugin,
+                                         GCancellable        *cancellable,
+                                         GAsyncReadyCallback  callback,
+                                         gpointer             user_data)
+{
+	/* Plugin object init. before runtime operations
+	 */
+	g_autoptr(GTask) task = NULL;
+	g_autoptr(GError) local_error = NULL;
+	g_autoptr(GsOsRelease) os_release = NULL;
+
+	task = g_task_new (plugin, cancellable, callback, user_data);
+	g_task_set_source_tag (task, gs_plugin_systemd_sysupdate_setup_async);
+
+	/* Check that the proxies exist (and are owned; they should auto-start)
+	 * so we can disable the plugin for systems which don’t have
+	 * systemd-sysupdate. */
+	g_dbus_connection_call (gs_plugin_get_system_bus_connection (plugin),
+	                        "org.freedesktop.DBus",
+	                        "/org/freedesktop/DBus",
+	                        "org.freedesktop.DBus",
+	                        "ListActivatableNames",
+	                        NULL,
+	                        (const GVariantType *) "(as)",
+	                        G_DBUS_CALL_FLAGS_NONE,
+	                        FREEDESKTOP_DBUS_LIST_ACTIVATABLE_NAMES_TIMEOUT_MS,
+	                        cancellable,
+	                        gs_plugin_systemd_sysupdate_setup_list_activatable_names_cb,
+	                        g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_systemd_sysupdate_setup_list_activatable_names_cb (GObject      *source_object,
+                                                             GAsyncResult *result,
+                                                             gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	GCancellable *cancellable = g_task_get_cancellable (task);
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	GsPlugin *plugin = GS_PLUGIN (self);
+	g_autoptr(GVariant) ret_val = NULL;
+	g_autofree gchar **activatable_names = NULL;
+	g_autoptr(GError) local_error = NULL;
+
+	ret_val = g_dbus_connection_call_finish (G_DBUS_CONNECTION (source_object), result, &local_error);
+	if (ret_val == NULL) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	g_variant_get (ret_val, "(^a&s)", &activatable_names);
+	if (!g_strv_contains ((const gchar *const *) activatable_names, "org.freedesktop.sysupdate1")) {
+		g_task_return_new_error_literal (task, GS_PLUGIN_ERROR,
+		                                 GS_PLUGIN_ERROR_PLUGIN_DEPSOLVE_FAILED,
+		                                 "D-Bus service org.freedesktop.sysupdate1 unavailable");
+		return;
+	}
+
+	gs_systemd_sysupdate_manager_proxy_new (gs_plugin_get_system_bus_connection (plugin),
+	                                        G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START_AT_CONSTRUCTION,
+	                                        "org.freedesktop.sysupdate1",
+	                                        "/org/freedesktop/sysupdate1",
+	                                        cancellable,
+	                                        gs_plugin_systemd_sysupdate_setup_proxy_new_cb,
+	                                        g_steal_pointer (&task));
+}
+
+static void
+manager_proxy_job_removed_cb (GsPluginSystemdSysupdate       *self,
+                              guint64                         job_id,
+                              const gchar                    *job_path,
+                              gint32                          job_status,
+                              GsSystemdSysupdateManagerProxy  proxy)
+{
+	gs_plugin_systemd_sysupdate_remove_job (self, job_path, job_status);
+}
+
+static void
+gs_plugin_systemd_sysupdate_setup_proxy_new_cb (GObject      *source_object,
+                                                GAsyncResult *result,
+                                                gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	g_autoptr(GsOsRelease) os_release = NULL;
+	const gchar *os_pretty_name = NULL;
+	const gchar *os_version = NULL;
+
+	self->manager_proxy = gs_systemd_sysupdate_manager_proxy_new_finish (result, &local_error);
+	if (self->manager_proxy == NULL) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	/* read os-release */
+	os_release = gs_os_release_new (&local_error);
+	if (local_error) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	os_pretty_name = gs_os_release_get_pretty_name (os_release);
+	if (os_pretty_name == NULL) {
+		os_pretty_name = "unknown";
+	}
+
+	os_version = gs_os_release_get_version (os_release);
+	if (os_version == NULL) {
+		os_version = "unknown";
+	}
+
+	/* `systemd-sysupdated` signal subscription */
+	g_signal_connect_object (self->manager_proxy,
+	                         "job-removed",
+	                         G_CALLBACK (manager_proxy_job_removed_cb),
+	                         self,
+	                         G_CONNECT_SWAPPED);
+
+	/* plugin object attributes init. */
+	self->os_pretty_name = g_strdup (os_pretty_name);
+	self->os_version = g_strdup (os_version);
+	self->cache_age_secs = 0;
+
+	/* on success */
+	g_task_return_boolean (task, TRUE);
+}
+
+static gboolean
+gs_plugin_systemd_sysupdate_setup_finish (GsPlugin      *plugin,
+                                          GAsyncResult  *result,
+                                          GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_systemd_sysupdate_refine_async (GsPlugin                   *plugin,
+                                          GsAppList                  *list,
+                                          GsPluginRefineFlags         job_flags,
+                                          GsPluginRefineRequireFlags  require_flags,
+                                          GsPluginEventCallback       event_callback,
+                                          void                       *event_user_data,
+                                          GCancellable               *cancellable,
+                                          GAsyncReadyCallback         callback,
+                                          gpointer                    user_data)
+{
+	GsPluginSystemdSysupdateRefineData *data = NULL;
+	g_autoptr(GTask) task = NULL;
+	g_autoptr(GQueue) queue = NULL;
+
+	task = g_task_new (plugin, cancellable, callback, user_data);
+	g_task_set_source_tag (task, gs_plugin_systemd_sysupdate_refine_async);
+
+	/* put apps to be refined in queue */
+	queue = g_queue_new ();
+	for (guint i = 0; i < gs_app_list_length (list); i++) {
+		GsApp *app = gs_app_list_index (list, i);
+
+		/* only process this app if was created by this plugin */
+		if (!gs_app_has_management_plugin (app, plugin))
+			continue;
+
+		g_queue_push_tail (queue, g_object_ref (app));
+	}
+
+	/* put apps in queue to task data */
+	data = gs_plugin_systemd_sysupdate_refine_data_new (g_steal_pointer (&queue), job_flags, require_flags);
+	g_task_set_task_data (task, data, (GDestroyNotify)gs_plugin_systemd_sysupdate_refine_data_free);
+
+	/* invoke the first target */
+	gs_plugin_systemd_sysupdate_refine_iter (NULL, NULL, g_steal_pointer (&task));
+}
+
+/* Iterate over the elements of the queue one-by-one.
+ */
+static void
+gs_plugin_systemd_sysupdate_refine_iter (GObject      *source_object,
+                                         GAsyncResult *result,
+                                         gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	GsPluginSystemdSysupdateRefineData *data = g_task_get_task_data (task);
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	GCancellable *cancellable = g_task_get_cancellable (task);
+	g_autoptr(GError) local_error = NULL;
+	g_autoptr (GsApp) app = NULL;
+
+	if (result != NULL &&
+	    !gs_plugin_systemd_sysupdate_refine_app_finish (GS_PLUGIN (self), result, &local_error)) {
+		g_debug ("Failed to refine app: %s", local_error->message);
+		g_clear_error (&local_error);
+	}
+
+	app = g_queue_pop_head (data->queue);
+	if (app == NULL) {
+		/* We reached the end of the queue. */
+		g_task_return_boolean (task, TRUE);
+		return;
+	}
+
+	if (g_task_return_error_if_cancelled (task)) {
+		g_debug ("%s: Cancelled", G_STRFUNC);
+		return;
+	}
+
+	gs_plugin_systemd_sysupdate_refine_app_async (GS_PLUGIN (self),
+	                                              app,
+	                                              data->job_flags,
+	                                              data->require_flags,
+	                                              cancellable,
+	                                              gs_plugin_systemd_sysupdate_refine_iter,
+	                                              g_steal_pointer (&task));
+}
+
+static gboolean
+gs_plugin_systemd_sysupdate_refine_finish (GsPlugin      *plugin,
+                                           GAsyncResult  *result,
+                                           GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_systemd_sysupdate_refine_app_async (GsPlugin                   *plugin,
+                                              GsApp                      *app,
+                                              GsPluginRefineFlags         job_flags,
+                                              GsPluginRefineRequireFlags  require_flags,
+                                              GCancellable               *cancellable,
+                                              GAsyncReadyCallback         callback,
+                                              gpointer                    user_data)
+{
+	GsPluginSystemdSysupdateRefineAppData *data = NULL;
+	GsPluginSystemdSysupdate *self = GS_PLUGIN_SYSTEMD_SYSUPDATE (plugin);
+	g_autoptr(GTask) task = NULL;
+	TargetItem *target = NULL;
+	const gchar *target_path = NULL;
+
+	task = g_task_new (plugin, cancellable, callback, user_data);
+	g_task_set_source_tag (task, gs_plugin_systemd_sysupdate_refine_app_async);
+
+	data = gs_plugin_systemd_sysupdate_refine_app_data_new (app);
+	g_task_set_task_data (task, data, (GDestroyNotify) gs_plugin_systemd_sysupdate_refine_app_data_free);
+
+	target = lookup_target_by_app (self, data->app);
+	if (target == NULL) {
+		g_task_return_new_error (task, G_IO_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "cannot find target for app: %s", gs_app_get_name (data->app));
+		return;
+	}
+
+	target_path = target->object_path;
+
+	gs_systemd_sysupdate_target_proxy_new (gs_plugin_get_system_bus_connection (plugin),
+	                                       G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
+	                                       "org.freedesktop.sysupdate1",
+	                                       target_path,
+	                                       cancellable,
+	                                       gs_plugin_systemd_sysupdate_refine_app_proxy_new_cb,
+	                                       g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_systemd_sysupdate_refine_app_proxy_new_cb (GObject      *source_object,
+                                                     GAsyncResult *result,
+                                                     gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	GCancellable *cancellable = g_task_get_cancellable (task);
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	g_autofree gchar *job_path = NULL;
+	g_autoptr(GsSystemdSysupdateTarget) proxy = NULL;
+	GsPluginSystemdSysupdateRefineAppData *data = g_task_get_task_data (task);
+	TargetItem *target = NULL;
+	const gchar *version = NULL;
+
+	proxy = gs_systemd_sysupdate_target_proxy_new_finish (result, &local_error);
+	if (proxy == NULL) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	target = lookup_target_by_app (self, data->app);
+	if (target == NULL) {
+		g_task_return_new_error (task, G_IO_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "cannot find target for app: %s", gs_app_get_name (data->app));
+		return;
+	}
+
+	version = target->latest_version != NULL ? target->latest_version
+	                                         : target->current_version;
+
+	/* if the version is not available, it will result an error
+	 * later in the callback */
+	gs_systemd_sysupdate_target_call_describe (proxy,
+	                                           version,
+	                                           SYSUPDATED_TARGET_DESCRIBE_FLAGS_NONE,
+	                                           G_DBUS_CALL_FLAGS_NONE,
+	                                           SYSUPDATED_TARGET_DESCRIBE_TIMEOUT_MS,
+	                                           cancellable,
+	                                           gs_plugin_systemd_sysupdate_refine_app_describe_cb,
+	                                           g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_systemd_sysupdate_refine_app_describe_cb (GObject      *source_object,
+                                                    GAsyncResult *result,
+                                                    gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	g_autofree gchar *json = NULL;
+
+	/* `systemd-sysupdated` also returns error when the given
+	 * version is not available (case both no version installed and
+	 * no available version in the server). we ignore the error here
+	 * and always move on to the next target */
+	if (!gs_systemd_sysupdate_target_call_describe_finish (GS_SYSTEMD_SYSUPDATE_TARGET (source_object),
+	                                                       &json,
+	                                                       result,
+	                                                       &local_error)) {
+		g_debug ("Describe target error ignored, error = `%s`", local_error->message);
+	}
+
+	g_task_return_boolean (task, TRUE);
+}
+
+static gboolean
+gs_plugin_systemd_sysupdate_refine_app_finish (GsPlugin      *plugin,
+                                               GAsyncResult  *result,
+                                               GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_systemd_sysupdate_list_apps_async (GsPlugin              *plugin,
+                                             GsAppQuery            *query,
+                                             GsPluginListAppsFlags  flags,
+                                             GsPluginEventCallback  event_callback,
+                                             void                  *event_user_data,
+                                             GCancellable          *cancellable,
+                                             GAsyncReadyCallback    callback,
+                                             gpointer               user_data)
+{
+	/* Return managed apps filtered by the given query
+	 */
+	GsPluginSystemdSysupdate *self = GS_PLUGIN_SYSTEMD_SYSUPDATE (plugin);
+	g_autoptr(GTask) task = NULL;
+	g_autoptr(GsAppList) list = gs_app_list_new ();
+	GsAppQueryTristate is_installed = GS_APP_QUERY_TRISTATE_UNSET;
+	GsAppQueryTristate is_for_update = GS_APP_QUERY_TRISTATE_UNSET;
+	const gchar * const *keywords = NULL;
+	GHashTableIter iter;
+	gpointer key;
+	gpointer value;
+
+	task = g_task_new (plugin, cancellable, callback, user_data);
+	g_task_set_source_tag (task, gs_plugin_systemd_sysupdate_list_apps_async);
+
+	/* here we report the system updates as individual apps, so user
+	 * can easily search and update a specific target */
+
+	if (query != NULL) {
+		is_installed = gs_app_query_get_is_installed (query);
+		is_for_update = gs_app_query_get_is_for_update (query);
+		keywords = gs_app_query_get_keywords (query);
+	}
+
+	/* currently only support a subset of query properties, and only
+	 * one set at once */
+	if ((is_installed == GS_APP_QUERY_TRISTATE_UNSET &&
+	     is_for_update == GS_APP_QUERY_TRISTATE_UNSET &&
+	     keywords == NULL) ||
+	    gs_app_query_get_n_properties_set (query) != 1) {
+		g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+		                         "Unsupported query");
+		return;
+	}
+
+	/* iterate over our targets, after `refresh_metadata()` we
+	 * should have target and its corresponding app created and
+	 * stored in the per-plugin cache */
+	g_hash_table_iter_init (&iter, self->target_item_map);
+	while (g_hash_table_iter_next (&iter, &key, &value)) {
+		TargetItem *target = (TargetItem *)value;
+		g_autoptr(GsApp) app = NULL;
+		g_autoptr(GError) local_error = NULL;
+
+		/* get or create app for the target */
+		app = get_or_create_app_for_target (self, target, &local_error);
+		if (app == NULL) {
+			g_debug ("Couldn't list app for target %s: %s", target_item_get_id (target), local_error->message);
+			continue;
+		}
+
+		if (keywords != NULL && !target_item_matches_keywords (target, keywords)) {
+			continue;
+		}
+
+		/* We support updating installed targets only. */
+		if (is_for_update == GS_APP_QUERY_TRISTATE_TRUE && !target_item_is_updatable (target)) {
+			continue;
+		}
+
+
+		if ((is_installed == GS_APP_QUERY_TRISTATE_TRUE && !target_item_is_installed (target)) ||
+		    (is_installed == GS_APP_QUERY_TRISTATE_FALSE && target_item_is_installed (target))) {
+			continue;
+		}
+
+		gs_app_list_add (list, app);
+	}
+
+	g_task_return_pointer (task, g_steal_pointer (&list), g_object_unref);
+}
+
+static GsAppList *
+gs_plugin_systemd_sysupdate_list_apps_finish (GsPlugin      *plugin,
+                                              GAsyncResult  *result,
+                                              GError       **error)
+{
+	return g_task_propagate_pointer (G_TASK (result), error);
+}
+
+static void
+gs_plugin_systemd_sysupdate_refresh_metadata_async (GsPlugin                     *plugin,
+                                                    guint64                       cache_age_secs,
+                                                    GsPluginRefreshMetadataFlags  flags,
+                                                    GsPluginEventCallback         event_callback,
+                                                    void                         *event_user_data,
+                                                    GCancellable                 *cancellable,
+                                                    GAsyncReadyCallback           callback,
+                                                    gpointer                      user_data)
+{
+	/* Periodically update the targets saved
+	 */
+	GsPluginSystemdSysupdate *self = GS_PLUGIN_SYSTEMD_SYSUPDATE (plugin);
+	g_autoptr(GTask) task = NULL;
+	GsPluginSystemdSysupdateRefreshMetadataData *data = NULL;
+	g_autoptr(GQueue) queue = NULL;
+	GDBusCallFlags call_flags = G_DBUS_CALL_FLAGS_NONE;
+
+	task = g_task_new (plugin, cancellable, callback, user_data);
+	g_task_set_source_tag (task, gs_plugin_systemd_sysupdate_refresh_metadata_async);
+
+	queue = g_queue_new ();
+
+	/* put apps in queue to task data */
+	data = gs_plugin_systemd_sysupdate_refresh_metadata_data_new (g_steal_pointer (&queue),
+	                                                              flags);
+	g_task_set_task_data (task, data, (GDestroyNotify)gs_plugin_systemd_sysupdate_refresh_metadata_data_free);
+
+	if (self->is_metadata_refresh_ongoing) {
+		g_task_return_boolean (task, TRUE);
+		return;
+	}
+
+	self->is_metadata_refresh_ongoing = TRUE; /* update immediately to block continuous refreshes */
+	self->cache_age_secs = cache_age_secs;
+
+	if (data->flags & GS_PLUGIN_REFRESH_METADATA_FLAGS_INTERACTIVE) {
+		call_flags |= G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION;
+	}
+
+	/* here we ask `systemd-sysupdated` to list all available
+	 * targets and enumerate the targets reported in the callback. */
+	gs_systemd_sysupdate_manager_call_list_targets (self->manager_proxy,
+	                                                call_flags,
+	                                                SYSUPDATED_MANAGER_LIST_TARGET_TIMEOUT_MS,
+	                                                cancellable,
+	                                                gs_plugin_systemd_sysupdate_refresh_metadata_list_targets_cb,
+	                                                g_steal_pointer (&task));
+}
+
+static gboolean
+check_to_be_removed (gpointer key, gpointer value, gpointer user_data)
+{
+	TargetItem *target = (TargetItem *) value;
+	return !target->is_valid;
+}
+
+static void
+gs_plugin_systemd_sysupdate_refresh_metadata_list_targets_cb (GObject      *source_object,
+                                                              GAsyncResult *result,
+                                                              gpointer      user_data)
+{
+	GsPluginSystemdSysupdateRefreshMetadataData *data = NULL;
+	TargetItem *target = NULL;
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	g_autoptr(GVariant) ret_targets = NULL;
+	g_autoptr(GVariantIter) variant_iter = NULL;
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	const gchar *class = NULL;
+	const gchar *name = NULL;
+	const gchar *object_path = NULL;
+	GHashTableIter iter;
+	gpointer key;
+	gpointer value;
+
+	if (!gs_systemd_sysupdate_manager_call_list_targets_finish (GS_SYSTEMD_SYSUPDATE_MANAGER (source_object),
+	                                                            &ret_targets,
+	                                                            result,
+	                                                            &local_error)) {
+		self->is_metadata_refresh_ongoing = FALSE;
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	data = g_task_get_task_data (task);
+
+	/* mark all targets saved as invalid to detect removals */
+	g_hash_table_iter_init (&iter, self->target_item_map);
+	while (g_hash_table_iter_next (&iter, NULL, &value)) {
+		target = (TargetItem *)value;
+		target->is_valid = FALSE;
+	}
+
+	/* iterate over targets and save to the target hashmap */
+	g_variant_get (ret_targets, "a(sso)", &variant_iter);
+	while (g_variant_iter_loop (variant_iter, "(&s&s&o)", &class, &name, &object_path)) {
+		g_hash_table_insert (self->target_item_map,
+		                     (gpointer) g_strdup (name),
+		                     (gpointer) target_item_new (class, name, object_path)); /* overwrite value */
+	}
+
+	/* remove targets no-longer exist and their apps */
+	g_hash_table_iter_init (&iter, self->target_item_map);
+	while (g_hash_table_iter_next (&iter, &key, &value)) {
+		if (check_to_be_removed (key, value, NULL)) {
+			gs_plugin_cache_remove (GS_PLUGIN (self), key);
+		}
+	}
+	g_hash_table_foreach_remove (self->target_item_map, (GHRFunc) check_to_be_removed, NULL);
+
+	/* push all targets to queue. Make 'host' the first target if it
+	 * exists, so other targets can point to it if it needs to */
+	g_hash_table_iter_init (&iter, self->target_item_map);
+	while (g_hash_table_iter_next (&iter, NULL, &value)) {
+		target = (TargetItem *)value;
+		if (g_strcmp0 (target->class, "host") == 0) {
+			g_queue_push_head (data->queue, value);
+		} else {
+			g_queue_push_tail (data->queue, value);
+		}
+	}
+
+	/* invoke the first target */
+	gs_plugin_systemd_sysupdate_refresh_metadata_iter (NULL, NULL, g_steal_pointer (&task));
+}
+
+/* Iterate over the elements of the queue one-by-one.
+ */
+static void
+gs_plugin_systemd_sysupdate_refresh_metadata_iter (GObject      *source_object,
+                                                   GAsyncResult *result,
+                                                   gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	GsPluginSystemdSysupdateRefreshMetadataData *data = g_task_get_task_data (task);
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	GCancellable *cancellable = g_task_get_cancellable (task);
+	g_autoptr(GError) local_error = NULL;
+	TargetItem *target;
+
+	if (result != NULL &&
+	    !gs_plugin_systemd_sysupdate_target_refresh_metadata_finish (GS_PLUGIN (self), result, &local_error)) {
+		g_debug ("Failed to refresh metadata: %s", local_error->message);
+		g_clear_error (&local_error);
+	}
+
+	target = g_queue_pop_head (data->queue);
+	if (target == NULL) {
+		self->is_metadata_refresh_ongoing = FALSE;
+		/* We reached the end of the queue. */
+		g_task_return_boolean (task, TRUE);
+		return;
+	}
+
+	if (g_task_return_error_if_cancelled (task)) {
+		self->is_metadata_refresh_ongoing = FALSE;
+		g_debug ("%s: Cancelled", G_STRFUNC);
+		return;
+	}
+
+	gs_plugin_systemd_sysupdate_target_refresh_metadata_async (GS_PLUGIN (self),
+	                                                           target,
+	                                                           data->flags,
+	                                                           cancellable,
+	                                                           gs_plugin_systemd_sysupdate_refresh_metadata_iter,
+	                                                           g_steal_pointer (&task));
+}
+
+static gboolean
+gs_plugin_systemd_sysupdate_refresh_metadata_finish (GsPlugin      *plugin,
+                                                     GAsyncResult  *result,
+                                                     GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_async (GsPlugin                     *plugin,
+                                                           TargetItem                   *target,
+                                                           GsPluginRefreshMetadataFlags  flags,
+                                                           GCancellable                 *cancellable,
+                                                           GAsyncReadyCallback           callback,
+                                                           gpointer                      user_data)
+{
+	/* Periodically update the targets saved
+	 */
+	g_autoptr(GTask) task = NULL;
+	GsPluginSystemdSysupdateTargetRefreshMetadataData *data = NULL;
+
+	task = g_task_new (plugin, cancellable, callback, user_data);
+	g_task_set_source_tag (task, gs_plugin_systemd_sysupdate_target_refresh_metadata_async);
+
+	/* put apps in queue to task data */
+	data = gs_plugin_systemd_sysupdate_target_refresh_metadata_data_new (target, flags);
+	g_task_set_task_data (task, data, (GDestroyNotify)gs_plugin_systemd_sysupdate_target_refresh_metadata_data_free);
+
+	gs_systemd_sysupdate_target_proxy_new (gs_plugin_get_system_bus_connection (plugin),
+	                                       G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
+	                                       "org.freedesktop.sysupdate1",
+	                                       data->target->object_path,
+	                                       cancellable,
+	                                       gs_plugin_systemd_sysupdate_target_refresh_metadata_proxy_new_cb,
+	                                       g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_proxy_new_cb (GObject      *source_object,
+                                                                  GAsyncResult *result,
+                                                                  gpointer      user_data)
+{
+	GsPluginSystemdSysupdateTargetRefreshMetadataData *data = NULL;
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	g_autoptr(GsSystemdSysupdateTarget) proxy = NULL;
+	GCancellable *cancellable = g_task_get_cancellable (task);
+	GDBusCallFlags call_flags = G_DBUS_CALL_FLAGS_NONE;
+
+	proxy = gs_systemd_sysupdate_target_proxy_new_finish (result, &local_error);
+	if (proxy == NULL) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	data = g_task_get_task_data (task);
+	g_set_object (&data->target->proxy, proxy);
+
+	if (data->flags & GS_PLUGIN_REFRESH_METADATA_FLAGS_INTERACTIVE) {
+		call_flags |= G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION;
+	}
+
+	gs_systemd_sysupdate_target_call_get_app_stream (data->target->proxy,
+	                                                 call_flags,
+	                                                 SYSUPDATED_TARGET_GET_APP_STREAM_TIMEOUT_MS,
+	                                                 cancellable,
+	                                                 gs_plugin_systemd_sysupdate_target_refresh_metadata_get_app_stream_cb,
+	                                                 g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_get_app_stream_cb (GObject      *source_object,
+                                                                       GAsyncResult *result,
+                                                                       gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	g_auto(GStrv) appstream_urls = NULL;
+	GsPluginSystemdSysupdateTargetRefreshMetadataData *data = NULL;
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	GsPlugin *plugin = GS_PLUGIN (self);
+	GCancellable *cancellable = g_task_get_cancellable (task);
+	const gchar *cache_kind = NULL;
+
+	if (!gs_systemd_sysupdate_target_call_get_app_stream_finish (GS_SYSTEMD_SYSUPDATE_TARGET (source_object),
+	                                                             &appstream_urls,
+	                                                             result,
+	                                                             &local_error)) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	data = g_task_get_task_data (task);
+
+	cache_kind = target_item_get_xml_cache_kind (data->target, plugin);
+
+	gs_external_appstream_refresh_async (cache_kind,
+	                                     appstream_urls,
+	                                     self->cache_age_secs,
+	                                     NULL,
+	                                     NULL,
+	                                     cancellable,
+	                                     gs_plugin_systemd_sysupdate_target_refresh_metadata_external_appstream_refresh_cb,
+	                                     g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_external_appstream_refresh_cb (GObject      *source_object,
+                                                                                   GAsyncResult *result,
+                                                                                   gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	GCancellable *cancellable = g_task_get_cancellable (task);
+	GsPluginSystemdSysupdateTargetRefreshMetadataData *data = NULL;
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	GsPlugin *plugin = GS_PLUGIN (self);
+	g_auto(GStrv) appstream_paths = NULL;
+	XbSilo *silo;
+	GDBusCallFlags call_flags = G_DBUS_CALL_FLAGS_NONE;
+
+	/* FIXME Should return which files were updated and which weren't so we can know which ones to reload. */
+	if (!gs_external_appstream_refresh_finish (result, &appstream_paths, &local_error)) {
+		/* Intentionally ignore errors to avoid blocking host updates
+		 * just because metadata failed to be updated. */
+		g_debug ("Failed to refresh appstream: %s", local_error->message);
+		g_clear_error (&local_error);
+	}
+
+	/* TODO Clear unused cached XML files for this target. */
+
+	data = g_task_get_task_data (task);
+
+	silo = target_item_ensure_silo_for_appstream_paths (data->target, plugin, appstream_paths, cancellable, &local_error);
+	if (silo == NULL) {
+		/* We don't want to block updates for the host target because we
+		 * couldn't get appstream metadata as this is how fixes to the
+		 * update process are delivered. */
+		if (g_strcmp0 (data->target->class, "host") == 0) {
+			g_debug ("Failed to get the XML blob for host target: %s", local_error->message);
+			g_clear_error (&local_error);
+		} else {
+			g_task_return_error (task, g_steal_pointer (&local_error));
+			return;
+		}
+	}
+
+	if (data->flags & GS_PLUGIN_REFRESH_METADATA_FLAGS_INTERACTIVE) {
+		call_flags |= G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION;
+	}
+
+	gs_systemd_sysupdate_target_call_get_version (data->target->proxy,
+	                                              call_flags,
+	                                              SYSUPDATED_TARGET_GET_VERSION_TIMEOUT_MS,
+	                                              cancellable,
+	                                              gs_plugin_systemd_sysupdate_target_refresh_metadata_get_version_cb,
+	                                              g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_get_version_cb (GObject      *source_object,
+                                                                    GAsyncResult *result,
+                                                                    gpointer      user_data)
+{
+	GsPluginSystemdSysupdateTargetRefreshMetadataData *data = NULL;
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	g_autofree gchar *current_version = NULL;
+	GCancellable *cancellable = g_task_get_cancellable (task);
+	GDBusCallFlags call_flags = G_DBUS_CALL_FLAGS_NONE;
+
+	if (!gs_systemd_sysupdate_target_call_get_version_finish (GS_SYSTEMD_SYSUPDATE_TARGET (source_object),
+	                                                          &current_version,
+	                                                          result,
+	                                                          &local_error)) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	data = g_task_get_task_data (task);
+
+	/* Ensure version strings are NULL rather than empty. */
+	g_clear_pointer (&data->target->current_version, g_free);
+	if (current_version != NULL && *current_version != '\0') {
+		data->target->current_version = g_steal_pointer (&current_version);
+	}
+
+	if (data->flags & GS_PLUGIN_REFRESH_METADATA_FLAGS_INTERACTIVE) {
+		call_flags |= G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION;
+	}
+
+	/* move on to check new version */
+	gs_systemd_sysupdate_target_call_check_new (data->target->proxy,
+	                                            call_flags,
+	                                            SYSUPDATED_TARGET_CHECK_NEW_TIMEOUT_MS,
+	                                            cancellable,
+	                                            gs_plugin_systemd_sysupdate_target_refresh_metadata_check_new_cb,
+	                                            g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_check_new_cb (GObject      *source_object,
+                                                                  GAsyncResult *result,
+                                                                  gpointer      user_data)
+{
+	GsPluginSystemdSysupdateTargetRefreshMetadataData *data = NULL;
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	g_autofree gchar *latest_version = NULL;
+	GCancellable *cancellable = g_task_get_cancellable (task);
+
+	/* currently, the returned result contains only one string
+	 * representing the latest version found in the server. However,
+	 * it can possibly be an empty string representing no newer
+	 * version available */
+	if (!gs_systemd_sysupdate_target_call_check_new_finish (GS_SYSTEMD_SYSUPDATE_TARGET (source_object),
+	                                                        &latest_version,
+	                                                        result,
+	                                                        &local_error)) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	data = g_task_get_task_data (task);
+
+	/* Ensure version strings are NULL rather than empty. */
+	g_clear_pointer (&data->target->latest_version, g_free);
+	if (latest_version != NULL && *latest_version != '\0') {
+		data->target->latest_version = g_steal_pointer (&latest_version);
+	}
+
+	if (data->target->latest_version) {
+		gs_systemd_sysupdate_target_call_describe (data->target->proxy,
+							   data->target->latest_version,
+							   SYSUPDATED_TARGET_DESCRIBE_FLAGS_NONE,
+							   G_DBUS_CALL_FLAGS_NONE,
+							   SYSUPDATED_TARGET_DESCRIBE_TIMEOUT_MS,
+							   cancellable,
+							   gs_plugin_systemd_sysupdate_target_refresh_metadata_describe_cb,
+							   g_steal_pointer (&task));
+	} else {
+		data->target->is_installed = true;
+		data->target->is_pending = false;
+		data->target->is_partial = false;
+		data->target->is_incomplete = false;
+
+		gs_plugin_systemd_sysupdate_target_refresh_metadata_done (g_task_get_source_object (task), task, data);
+	}
+}
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_describe_cb (GObject      *source_object,
+								 GAsyncResult *result,
+								 gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	GsPluginSystemdSysupdateTargetRefreshMetadataData *data = g_task_get_task_data (task);
+	g_autoptr(GsApp) app = NULL;
+	g_autoptr(GError) local_error = NULL;
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	g_autofree gchar *json = NULL;
+	g_autoptr(JsonParser) json_parser = NULL;
+	JsonNode *json_root;
+	JsonObject *json_item;
+
+	if (!gs_systemd_sysupdate_target_call_describe_finish (GS_SYSTEMD_SYSUPDATE_TARGET (source_object),
+	                                                       &json,
+	                                                       result,
+	                                                       &local_error)) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	json_parser = json_parser_new_immutable ();
+	if (!json_parser_load_from_data (json_parser, json, -1, &local_error)) {
+		g_task_return_new_error (task, G_IO_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "json from describe call for target %s has no root: %s", target_item_get_id (data->target), local_error->message);
+		return;
+	}
+
+	json_root = json_parser_get_root (json_parser);
+	if (json_root == NULL) {
+		g_task_return_new_error (task, G_IO_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "json from describe call for target %s has no root", target_item_get_id (data->target));
+		return;
+	}
+	if (json_node_get_node_type (json_root) != JSON_NODE_OBJECT) {
+		g_task_return_new_error (task, G_IO_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "json from describe call for target %s is not an object", target_item_get_id (data->target));
+		return;
+	}
+	json_item = json_node_get_object (json_root);
+	if (json_item == NULL) {
+		g_task_return_new_error (task, G_IO_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "json from describe call for target %s is not an object", target_item_get_id (data->target));
+		return;
+	}
+
+	data->target->is_installed = json_object_get_boolean_member_with_default (json_item, "installed", false);
+	data->target->is_pending = json_object_get_boolean_member_with_default (json_item, "pending", false);
+	data->target->is_partial = json_object_get_boolean_member_with_default (json_item, "partial", false);
+	data->target->is_incomplete = json_object_get_boolean_member_with_default (json_item, "incomplete", false);
+
+	gs_plugin_systemd_sysupdate_target_refresh_metadata_done (self, task, data);
+}
+
+static void
+gs_plugin_systemd_sysupdate_target_refresh_metadata_done (GsPluginSystemdSysupdate *self,
+							  GTask *task,
+							  GsPluginSystemdSysupdateTargetRefreshMetadataData *data) {
+	g_autoptr(GsApp) app = NULL;
+	g_autoptr(GError) local_error = NULL;
+
+	/* update app state base on the target's new version */
+	app = get_or_create_app_for_target (self, data->target, &local_error);
+	if (app == NULL) {
+		g_debug ("Couldn't refresh app for target %s: %s", target_item_get_id (data->target), local_error->message);
+		g_clear_error (&local_error);
+	} else {
+		update_app_for_target (self, app, data->target);
+	}
+
+	g_task_return_boolean (task, TRUE);
+}
+
+static gboolean
+gs_plugin_systemd_sysupdate_target_refresh_metadata_finish (GsPlugin      *plugin,
+                                                            GAsyncResult  *result,
+                                                            GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void update_apps_cancelled_cb (GCancellable *cancellable,
+                                      gpointer      user_data);
+
+static void
+gs_plugin_systemd_sysupdate_update_apps_async (GsPlugin                           *plugin,
+                                               GsAppList                          *apps,
+                                               GsPluginUpdateAppsFlags             flags,
+                                               GsPluginProgressCallback            progress_callback,
+                                               gpointer                            progress_user_data,
+                                               GsPluginEventCallback               event_callback,
+                                               void                               *event_user_data,
+                                               GsPluginAppNeedsUserActionCallback  app_needs_user_action_callback,
+                                               gpointer                            app_needs_user_action_data,
+                                               GCancellable                       *cancellable,
+                                               GAsyncReadyCallback                 callback,
+                                               gpointer                            user_data)
+{
+	/* Install the given system updates
+	 */
+	g_autoptr(UpdateAppsData) data = NULL;
+	g_autoptr(GTask) task = NULL;
+	g_autoptr(GsAppList) filtered_apps = NULL;
+	gboolean interactive = (flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE);
+
+	task = g_task_new (plugin, cancellable, callback, user_data);
+	g_task_set_source_tag (task, gs_plugin_systemd_sysupdate_update_apps_async);
+
+	/* Since systemd 260, systemd-sysupdate supports separately downloading
+	 * (‘acquiring’) and applying (installing) an update. Prior to that, it
+	 * could only do them as a single operation. */
+
+	/* Pre-filter the app list. */
+	filtered_apps = gs_app_list_new ();
+	for (guint i = 0; i < gs_app_list_length (apps); i++) {
+		GsApp *app = gs_app_list_index (apps, i);
+
+		/* This should be guaranteed by GsPluginJobUpdateApps */
+		g_assert (gs_app_has_management_plugin (app, plugin));
+
+		/* only update the app if it is source available */
+		if (gs_app_get_state (app) != GS_APP_STATE_AVAILABLE &&
+		    gs_app_get_state (app) != GS_APP_STATE_AVAILABLE_LOCAL &&
+		    gs_app_get_state (app) != GS_APP_STATE_UPDATABLE &&
+		    gs_app_get_state (app) != GS_APP_STATE_UPDATABLE_LIVE &&
+		    gs_app_get_state (app) != GS_APP_STATE_QUEUED_FOR_INSTALL) {
+			continue;
+		}
+
+		gs_app_list_add (filtered_apps, app);
+	}
+
+	if (gs_app_list_length (filtered_apps) == 0) {
+		g_task_return_boolean (task, TRUE);
+		return;
+	}
+
+	/* put apps in queue to task data */
+	data = g_new0 (UpdateAppsData, 1);
+	data->apps = g_steal_pointer (&filtered_apps);
+	data->flags = flags;
+	data->progress_callback = progress_callback;
+	data->progress_user_data = progress_user_data;
+	data->event_callback = event_callback;
+	data->event_user_data = event_user_data;
+	data->app_needs_user_action_callback = app_needs_user_action_callback;
+	data->app_needs_user_action_data = app_needs_user_action_data;
+
+	g_task_set_task_data (task, g_steal_pointer (&data), (GDestroyNotify) update_apps_data_free);
+
+	if (!interactive && !(flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_DOWNLOAD)) {
+		g_auto(GVariantDict) parameters_dict = G_VARIANT_DICT_INIT (NULL);
+		g_variant_dict_insert (&parameters_dict, "resumable", "b", FALSE);
+		gs_metered_block_on_download_scheduler_async (g_variant_dict_end (&parameters_dict),
+		                                              cancellable,
+		                                              gs_plugin_systemd_sysupdate_update_apps_download_scheduler_cb,
+		                                              g_steal_pointer (&task));
+	} else {
+		gs_plugin_systemd_sysupdate_update_apps_download_scheduler_cb (NULL, NULL, g_steal_pointer (&task));
+	}
+}
+
+static void
+gs_plugin_systemd_sysupdate_update_apps_download_scheduler_cb (GObject      *source_object,
+                                                               GAsyncResult *result,
+                                                               gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	GCancellable *cancellable = g_task_get_cancellable (task);
+	UpdateAppsData *data = g_task_get_task_data (task);
+	g_autoptr(GError) local_error = NULL;
+
+	if (result != NULL &&
+	    !gs_metered_block_on_download_scheduler_finish (result, &data->schedule_entry_handle, &local_error)) {
+		if (!g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+			g_warning ("Failed to block on download scheduler: %s",
+				   local_error->message);
+		g_clear_error (&local_error);
+	}
+
+	/* connect to cancellation signal */
+	if (g_task_return_error_if_cancelled (task)) {
+		remove_schedule_entry (g_steal_pointer (&data->schedule_entry_handle));
+		return;
+	}
+
+	if (cancellable != NULL) {
+		data->cancellable = cancellable;  /* so we can disconnect later */
+		data->cancelled_id = g_cancellable_connect (cancellable,
+		                                            G_CALLBACK (update_apps_cancelled_cb),
+		                                            task,
+		                                            NULL);
+	}
+
+	gs_plugin_systemd_sysupdate_update_apps_iter (NULL, NULL, g_steal_pointer (&task));
+}
+
+static void
+update_apps_cancelled_cb (GCancellable *cancellable,
+                          gpointer      user_data)
+{
+	GTask *task = G_TASK (user_data);
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	UpdateAppsData *data = g_task_get_task_data (task);
+
+	if (!g_cancellable_is_cancelled (cancellable))
+		return;
+
+	g_debug ("%s called with current_update_app_index %u",
+		 G_STRFUNC, data->current_update_app_index);
+
+	if (data->current_update_app_index < gs_app_list_length (data->apps)) {
+		GsApp *app = gs_app_list_index (data->apps, data->current_update_app_index);
+		gs_plugin_systemd_sysupdate_cancel_job (self, app, data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE);
+	}
+}
+
+/* Iterate over the elements of the queue one-by-one.
+ *
+ * While the typical use case is to have only a single update target, there
+ * could be multiple ones, so this could be improved in the future by applying
+ * the updates in parallel.
+ */
+static void
+gs_plugin_systemd_sysupdate_update_apps_iter (GObject      *source_object,
+                                              GAsyncResult *result,
+                                              gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	UpdateAppsData *data = g_task_get_task_data (task);
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	GCancellable *cancellable = g_task_get_cancellable (task);
+	g_autoptr(GError) local_error = NULL;
+	GsApp *app = NULL;
+
+	if (result != NULL &&
+	    !gs_plugin_systemd_sysupdate_update_app_finish (GS_PLUGIN (self), result, &local_error)) {
+		GsApp *previous_app;
+
+		g_assert (data->current_update_app_index > 0);
+		previous_app = gs_app_list_index (data->apps, data->current_update_app_index - 1);
+
+		g_debug ("Failed to update app ‘%s’: %s", gs_app_get_id (previous_app), local_error->message);
+
+		if (data->event_callback != NULL) {
+			g_autoptr(GsPluginEvent) event = NULL;
+
+			gs_plugin_systemd_sysupdate_error_convert (&local_error);
+
+			event = gs_plugin_event_new ("error", local_error,
+						     "app", previous_app,
+						     NULL);
+			if (data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE)
+				gs_plugin_event_add_flag (event, GS_PLUGIN_EVENT_FLAG_INTERACTIVE);
+			gs_plugin_event_add_flag (event, GS_PLUGIN_EVENT_FLAG_WARNING);
+
+			data->event_callback (GS_PLUGIN (self), event, data->event_user_data);
+		}
+
+		g_clear_error (&local_error);
+	}
+
+	if (data->current_update_app_index == gs_app_list_length (data->apps)) {
+		/* We reached the end of the queue. */
+		remove_schedule_entry (g_steal_pointer (&data->schedule_entry_handle));
+		gs_plugin_updates_changed (GS_PLUGIN (self));
+
+		g_task_return_boolean (task, TRUE);
+		return;
+	}
+
+	if (g_task_return_error_if_cancelled (task)) {
+		g_debug ("%s: Cancelled", G_STRFUNC);
+		remove_schedule_entry (g_steal_pointer (&data->schedule_entry_handle));
+		return;
+	}
+
+	app = gs_app_list_index (data->apps, data->current_update_app_index);
+	data->current_update_app_index++;
+	gs_plugin_systemd_sysupdate_update_app_async (self,
+	                                              app,
+	                                              data->flags,
+	                                              data->progress_callback,
+	                                              data->progress_user_data,
+	                                              data->app_needs_user_action_callback,
+	                                              data->app_needs_user_action_data,
+	                                              cancellable,
+	                                              gs_plugin_systemd_sysupdate_update_apps_iter,
+	                                              g_steal_pointer (&task));
+}
+
+static gboolean
+gs_plugin_systemd_sysupdate_update_apps_finish (GsPlugin      *plugin,
+                                                GAsyncResult  *result,
+                                                GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_systemd_sysupdate_update_app_async (GsPluginSystemdSysupdate           *self,
+                                              GsApp                              *app,
+                                              GsPluginUpdateAppsFlags             flags,
+                                              GsPluginProgressCallback            progress_callback,
+                                              gpointer                            progress_user_data,
+                                              GsPluginAppNeedsUserActionCallback  app_needs_user_action_callback,
+                                              gpointer                            app_needs_user_action_data,
+                                              GCancellable                       *cancellable,
+                                              GAsyncReadyCallback                 callback,
+                                              gpointer                            user_data)
+{
+	/* Install the given system updates
+	 */
+	g_autoptr(UpdateAppData) data_owned = NULL;
+	UpdateAppData *data;
+	g_autoptr(GTask) task = NULL;
+	TargetItem *target = NULL;
+
+	task = g_task_new (self, cancellable, callback, user_data);
+	g_task_set_source_tag (task, gs_plugin_systemd_sysupdate_update_apps_async);
+
+	data = data_owned = g_new0 (UpdateAppData, 1);
+	data->app = g_object_ref (app);
+	data->flags = flags;
+
+	g_task_set_task_data (task, g_steal_pointer (&data_owned), (GDestroyNotify) update_app_data_free);
+
+	/* find the target associated to the app */
+	target = lookup_target_by_app (self, data->app);
+	if (target == NULL) {
+		g_task_return_new_error (task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "Can´t find target for app: %s", gs_app_get_name (data->app));
+		return;
+	}
+
+	/* update the 'target' to specific version */
+	data->target_path = g_strdup (target->object_path);
+
+	/* This method will trigger the update to start and return
+	 * immediately. Results should be waited and handled within the
+	 * signal `Manager.JobRemoved()` */
+	gs_systemd_sysupdate_target_proxy_new (gs_plugin_get_system_bus_connection (GS_PLUGIN (self)),
+	                                       G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
+	                                       "org.freedesktop.sysupdate1",
+	                                       target->object_path,
+	                                       cancellable,
+	                                       gs_plugin_systemd_sysupdate_update_app_proxy_new_cb,
+	                                       g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_systemd_sysupdate_update_app_proxy_new_cb (GObject      *source_object,
+                                                     GAsyncResult *result,
+                                                     gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	g_autoptr(GsSystemdSysupdateTarget) proxy = NULL;
+	UpdateAppData *data = g_task_get_task_data (task);
+	GDBusCallFlags call_flags = G_DBUS_CALL_FLAGS_NONE;
+
+	proxy = gs_systemd_sysupdate_target_proxy_new_finish (result, &local_error);
+	if (proxy == NULL) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	g_assert (data->target_proxy == NULL);
+	data->target_proxy = g_object_ref (proxy);
+
+	if (data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE) {
+		call_flags |= G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION;
+	}
+
+	if (!(data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_DOWNLOAD)) {
+		gs_app_set_state (data->app, GS_APP_STATE_DOWNLOADING);
+		gs_app_set_progress (data->app, 0);
+
+		gs_systemd_sysupdate_target_call_acquire (data->target_proxy,
+		                                          "", /* left empty as the latest version */
+		                                          SYSUPDATED_TARGET_ACQUIRE_FLAGS_NONE,
+		                                          call_flags,
+		                                          SYSUPDATED_TARGET_ACQUIRE_TIMEOUT_MS,
+		                                          NULL, /* Makes the call explicitly non-cancellable so we can get the job path and cancel it correctly. */
+		                                          gs_plugin_systemd_sysupdate_update_app_acquire_cb,
+		                                          g_steal_pointer (&task));
+	} else {
+		/* Skip downloading the update and instead try to apply any
+		 * updates which were previously downloaded. */
+		g_assert (!(data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY));
+
+		data->acquire_job_path = NULL;
+
+		gs_app_set_state (data->app, GS_APP_STATE_INSTALLING);
+		gs_app_set_progress (data->app, 0);
+
+		gs_systemd_sysupdate_target_call_install (data->target_proxy,
+		                                          "", /* left empty as the latest version */
+		                                          SYSUPDATED_TARGET_INSTALL_FLAGS_NONE,
+		                                          call_flags,
+		                                          SYSUPDATED_TARGET_INSTALL_TIMEOUT_MS,
+		                                          NULL, /* Makes the call explicitly non-cancellable so we can get the job path and cancel it correctly. */
+		                                          gs_plugin_systemd_sysupdate_update_app_install_cb,
+		                                          g_steal_pointer (&task));
+	}
+}
+
+static void
+gs_plugin_systemd_sysupdate_update_app_acquire_cb (GObject      *source_object,
+                                                   GAsyncResult *result,
+                                                   gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	g_autofree gchar *job_path = NULL;
+	GsPlugin *plugin = GS_PLUGIN (self);
+	UpdateAppData *data = g_task_get_task_data (task);
+
+	if (!gs_systemd_sysupdate_target_call_acquire_finish (GS_SYSTEMD_SYSUPDATE_TARGET (source_object),
+	                                                      NULL,
+	                                                      NULL,
+	                                                      &job_path,
+	                                                      result,
+	                                                      &local_error)) {
+
+
+		if (g_dbus_error_is_remote_error (local_error)) {
+			g_autofree gchar *error_name = NULL;
+
+			error_name = g_dbus_error_get_remote_error (local_error);
+
+			if (g_str_equal (error_name, "org.freedesktop.sysupdate1.NoCandidate")) {
+				gs_app_set_state (data->app, GS_APP_STATE_UPDATABLE_LIVE);
+				gs_app_set_size_download (data->app, GS_SIZE_TYPE_VALID, 0);
+
+				if (!(data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY)) {
+					GDBusCallFlags call_flags = G_DBUS_CALL_FLAGS_NONE;
+
+					if (data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE) {
+						call_flags |= G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION;
+					}
+
+					gs_app_set_state (data->app, GS_APP_STATE_INSTALLING);
+
+					gs_systemd_sysupdate_target_call_install (data->target_proxy,
+										  "", /* left empty as the latest version */
+										  SYSUPDATED_TARGET_INSTALL_FLAGS_NONE,
+										  call_flags,
+										  SYSUPDATED_TARGET_INSTALL_TIMEOUT_MS,
+										  NULL, /* Makes the call explicitly non-cancellable so we can get the job path and cancel it correctly. */
+										  gs_plugin_systemd_sysupdate_update_app_install_cb,
+										  g_object_ref (task));
+
+				}
+
+				g_task_return_boolean (task, TRUE);
+				return;
+			}
+		}
+		gs_app_set_state_recover (data->app);
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	data->current_job_path = data->acquire_job_path = g_steal_pointer (&job_path);
+
+	gs_systemd_sysupdate_job_proxy_new (gs_plugin_get_system_bus_connection (plugin),
+	                                    G_DBUS_PROXY_FLAGS_NONE,
+	                                    "org.freedesktop.sysupdate1",
+	                                    data->current_job_path,
+	                                    NULL, /* Makes the call explicitly non-cancellable so we can get the job path and cancel it correctly. */
+	                                    gs_plugin_systemd_sysupdate_update_app_job_proxy_new_cb,
+	                                    g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_systemd_sysupdate_update_app_install_cb (GObject      *source_object,
+                                                   GAsyncResult *result,
+                                                   gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	g_autofree gchar *job_path = NULL;
+	GsPlugin *plugin = GS_PLUGIN (self);
+	UpdateAppData *data = g_task_get_task_data (task);
+
+	if (!gs_systemd_sysupdate_target_call_install_finish (GS_SYSTEMD_SYSUPDATE_TARGET (source_object),
+	                                                      NULL,
+	                                                      NULL,
+	                                                      &job_path,
+	                                                      result,
+	                                                      &local_error)) {
+		if (g_dbus_error_is_remote_error (local_error)) {
+			g_autofree gchar *error_name = NULL;
+
+			error_name = g_dbus_error_get_remote_error (local_error);
+
+			if (g_str_equal (error_name, "org.freedesktop.sysupdate1.NoCandidate")) {
+				const gchar *target_class = NULL;
+				gboolean target_is_host = FALSE;
+
+				target_class = gs_app_get_metadata_item (data->app, "SystemdSysupdated::Class");
+				target_is_host = g_strcmp0 (target_class, "host") == 0;
+
+				gs_app_set_progress (data->app, GS_APP_PROGRESS_UNKNOWN);
+				if (target_is_host) {
+					gs_app_set_state (data->app, GS_APP_STATE_UPDATABLE_LIVE);
+					gs_app_set_size_download (data->app, GS_SIZE_TYPE_VALID, 0);
+				} else {
+					gs_app_set_state (data->app, GS_APP_STATE_INSTALLED);
+				}
+
+				g_task_return_boolean (task, TRUE);
+				return;
+			}
+		}
+
+		gs_app_set_state_recover (data->app);
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	/* The old value of `current_job_path` has already been removed from the
+	 * hash tables in gs_plugin_systemd_sysupdate_remove_job_apply(). */
+	data->current_job_path = data->install_job_path = g_steal_pointer (&job_path);
+
+	gs_systemd_sysupdate_job_proxy_new (gs_plugin_get_system_bus_connection (plugin),
+	                                    G_DBUS_PROXY_FLAGS_NONE,
+	                                    "org.freedesktop.sysupdate1",
+	                                    data->current_job_path,
+	                                    NULL, /* Makes the call explicitly non-cancellable so we can get the job path and cancel it correctly. */
+	                                    gs_plugin_systemd_sysupdate_update_app_job_proxy_new_cb,
+	                                    g_steal_pointer (&task));
+}
+
+/* This is called when the Job proxy is ready for *either* the Acquire() call
+ * or the Install() call. */
+static void
+gs_plugin_systemd_sysupdate_update_app_job_proxy_new_cb (GObject      *source_object,
+                                                         GAsyncResult *result,
+                                                         gpointer      user_data)
+{
+	g_autoptr(GTask) task = g_steal_pointer (&user_data);
+	g_autoptr(GError) local_error = NULL;
+	g_autoptr(GsSystemdSysupdateJob) proxy = NULL;
+	GCancellable *cancellable = g_task_get_cancellable (task);
+	UpdateAppData *data = g_task_get_task_data (task);
+	GsPluginSystemdSysupdate *self = g_task_get_source_object (task);
+	GDBusCallFlags call_flags = G_DBUS_CALL_FLAGS_NONE;
+	void *job_status_ptr, *cancel_task_ptr;
+
+	proxy = gs_systemd_sysupdate_job_proxy_new_finish (result, &local_error);
+	if (proxy == NULL) {
+		gs_app_set_state_recover (data->app);
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		/* The job's preparation failed, we can't act on it, revoke any
+		 * removal or cancellation request that we filed during its
+		 * preparation. */
+		gs_plugin_systemd_sysupdate_remove_job_revoke (self, data->current_job_path);
+		gs_plugin_systemd_sysupdate_cancel_job_revoke (self, data->current_job_path);
+		return;
+	}
+
+	g_set_object (&data->current_job_proxy, proxy);
+
+	g_signal_connect_object (proxy, "notify::progress",
+	                         G_CALLBACK (gs_plugin_systemd_sysupdate_update_app_notify_progress_cb),
+	                         task, G_CONNECT_DEFAULT);
+
+	gs_plugin_systemd_sysupdate_update_app_notify_progress_cb (G_OBJECT (proxy), NULL, task);
+
+	/* job path to task mapping, easier for the callbacks to use the
+	 * object path to find its related task */
+	g_hash_table_insert (self->job_task_map,
+	                     g_strdup (data->current_job_path),
+	                     g_object_ref (task));
+
+	/* We don't chain up or return here, the task will be terminated when
+	 * systemd-sysupdate notifies us that the job is removed, or by
+	 * cancelling the task.
+	 *
+	 * See gs_plugin_systemd_sysupdate_remove_job_apply(). */
+
+	/* If the update job has been filed for removal during its preparation,
+	 * we need to resume the removal request. This will also revoke any
+	 * cancellation request. */
+	if (g_hash_table_lookup_extended (self->job_to_remove_status_map, data->current_job_path, NULL, &job_status_ptr)) {
+		gint32 job_status = GPOINTER_TO_INT (job_status_ptr);
+		gs_plugin_systemd_sysupdate_remove_job_apply (self, task, data->current_job_path, job_status);
+		return;
+	}
+
+	/* If the update job has been filed for cancellation during its
+	 * preparation, we need to resume the cancellation request. */
+	if (g_hash_table_lookup_extended (self->job_to_cancel_task_map, data->current_job_path, NULL, &cancel_task_ptr)) {
+		GTask *cancel_task = G_TASK (cancel_task_ptr);
+
+		if (data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE) {
+			call_flags |= G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION;
+		}
+
+		gs_systemd_sysupdate_job_call_cancel (data->current_job_proxy,
+		                                      call_flags,
+		                                      SYSUPDATED_JOB_CANCEL_TIMEOUT_MS,
+		                                      g_task_get_cancellable (cancel_task),
+		                                      gs_plugin_systemd_sysupdate_cancel_job_cancel_cb,
+		                                      g_object_ref (cancel_task));
+		return;
+	}
+
+	/* If the task has been cancelled during its preparation, we need to ask
+	 * systemd-sysupdated to cancel it. */
+	if (g_cancellable_is_cancelled (cancellable)) {
+		gs_plugin_systemd_sysupdate_cancel_job (self, data->app,
+							data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE);
+	}
+}
+
+static void
+gs_plugin_systemd_sysupdate_update_app_notify_progress_cb (GObject    *object,
+                                                           GParamSpec *pspec,
+                                                           void       *user_data)
+{
+	GsSystemdSysupdateJob *job = GS_SYSTEMD_SYSUPDATE_JOB (object);
+	GTask *task = G_TASK (user_data);
+	UpdateAppData *data = g_task_get_task_data (task);
+	unsigned int progress = gs_systemd_sysupdate_job_get_progress (job);
+	const char *job_type = gs_systemd_sysupdate_job_get_type_ (job);
+	unsigned int n_jobs;
+
+	progress = MIN (progress, 100);
+
+	/* The progress is split in halves: the first 50% of progress is for
+	 * downloading (the Acquire job); the second 50% is for installing (the
+	 * Install job). */
+	n_jobs = (2 -
+		  ((data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_DOWNLOAD) ? 1 : 0) -
+		  ((data->flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY) ? 1 : 0));
+	g_assert (n_jobs == 1 || n_jobs == 2);
+
+	if (g_str_equal (job_type, "acquire")) {
+		gs_app_set_state (data->app, GS_APP_STATE_DOWNLOADING);
+		gs_app_set_progress (data->app, progress / n_jobs);
+	} else if (g_str_equal (job_type, "install")) {
+		gs_app_set_state (data->app, GS_APP_STATE_INSTALLING);
+		gs_app_set_progress (data->app, ((n_jobs - 1) * (100 / n_jobs)) + progress / n_jobs);
+	} else {
+		g_critical ("Unrecognised job type ‘%s’", job_type);
+		g_assert_not_reached ();
+	}
+}
+
+static gboolean
+gs_plugin_systemd_sysupdate_update_app_finish (GsPlugin      *plugin,
+                                               GAsyncResult  *result,
+                                               GError       **error)
+{
+	GTask *task = G_TASK (result);
+
+	return g_task_propagate_boolean (g_steal_pointer (&task), error);
+}
+
+static void
+gs_plugin_systemd_sysupdate_install_apps_async (GsPlugin                           *plugin,
+                                                GsAppList                          *apps,
+                                                GsPluginInstallAppsFlags            flags,
+                                                GsPluginProgressCallback            progress_callback,
+                                                gpointer                            progress_user_data,
+                                                GsPluginEventCallback               event_callback,
+                                                void                               *event_user_data,
+                                                GsPluginAppNeedsUserActionCallback  app_needs_user_action_callback,
+                                                gpointer                            app_needs_user_action_data,
+                                                GCancellable                       *cancellable,
+                                                GAsyncReadyCallback                 callback,
+                                                gpointer                            user_data)
+{
+	GsPluginUpdateAppsFlags update_flags = GS_PLUGIN_UPDATE_APPS_FLAGS_NONE;
+
+	if (flags & GS_PLUGIN_INSTALL_APPS_FLAGS_INTERACTIVE)
+		update_flags |= GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE;
+	if (flags & GS_PLUGIN_INSTALL_APPS_FLAGS_NO_DOWNLOAD)
+		update_flags |= GS_PLUGIN_UPDATE_APPS_FLAGS_NO_DOWNLOAD;
+	if (flags & GS_PLUGIN_INSTALL_APPS_FLAGS_NO_APPLY)
+		update_flags |= GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY;
+
+	gs_plugin_systemd_sysupdate_update_apps_async (plugin,
+	                                               apps,
+	                                               update_flags,
+	                                               progress_callback,
+	                                               progress_user_data,
+	                                               event_callback,
+	                                               event_user_data,
+	                                               app_needs_user_action_callback,
+	                                               app_needs_user_action_data,
+	                                               cancellable,
+	                                               callback,
+	                                               user_data);
+}
+
+static gboolean
+gs_plugin_systemd_sysupdate_install_apps_finish (GsPlugin      *plugin,
+                                                 GAsyncResult  *result,
+                                                 GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_systemd_sysupdate_download_upgrade_async (GsPlugin                     *plugin,
+                                                    GsApp                        *app,
+                                                    GsPluginDownloadUpgradeFlags  flags,
+                                                    GsPluginEventCallback         event_callback,
+                                                    void                         *event_user_data,
+                                                    GCancellable                 *cancellable,
+                                                    GAsyncReadyCallback           callback,
+                                                    gpointer                      user_data)
+{
+	/* Flag specific distro upgrade as downloadable and installable
+	 */
+	g_autoptr(GTask) task = NULL;
+
+	task = g_task_new (plugin, cancellable, callback, user_data);
+	g_task_set_source_tag (task, gs_plugin_systemd_sysupdate_download_upgrade_async);
+
+	/* only process this app if was created by this plugin */
+	if (!gs_app_has_management_plugin (app, plugin)) {
+		g_task_return_boolean (task, TRUE);
+		return;
+	}
+
+	/* only update the app if it is source available */
+	if (gs_app_get_state (app) != GS_APP_STATE_AVAILABLE &&
+	    gs_app_get_state (app) != GS_APP_STATE_AVAILABLE_LOCAL) {
+		g_task_return_boolean (task, TRUE);
+		return;
+	}
+
+	gs_app_set_state (app, GS_APP_STATE_UPDATABLE_LIVE);
+	g_task_return_boolean (task, TRUE);
+}
+
+static gboolean
+gs_plugin_systemd_sysupdate_download_upgrade_finish (GsPlugin      *plugin,
+                                                     GAsyncResult  *result,
+                                                     GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_systemd_sysupdate_trigger_upgrade_async (GsPlugin                    *plugin,
+                                                   GsApp                       *app,
+                                                   GsPluginTriggerUpgradeFlags  flags,
+                                                   GCancellable                *cancellable,
+                                                   GAsyncReadyCallback          callback,
+                                                   gpointer                     user_data)
+{
+	GsPluginUpdateAppsFlags update_flags = GS_PLUGIN_UPDATE_APPS_FLAGS_NONE;
+
+	/* Download and install specific distro upgrade
+	 */
+	g_autoptr(GsAppList) apps = NULL;
+
+	apps = gs_app_list_new ();
+	gs_app_list_add (apps, app);
+
+	if (flags & GS_PLUGIN_TRIGGER_UPGRADE_FLAGS_INTERACTIVE)
+		update_flags |= GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE;
+
+	gs_plugin_systemd_sysupdate_update_apps_async (plugin, apps,
+	                                               update_flags,
+	                                               NULL, NULL,
+	                                               NULL, NULL,
+	                                               NULL, NULL,
+	                                               cancellable,
+	                                               callback, user_data);
+}
+
+static gboolean
+gs_plugin_systemd_sysupdate_trigger_upgrade_finish (GsPlugin      *plugin,
+                                                    GAsyncResult  *result,
+                                                    GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_systemd_sysupdate_adopt_app (GsPlugin *plugin,
+                                       GsApp    *app)
+{
+	/* Adopt app originally discovered by other plugins
+	 */
+
+#if AS_CHECK_VERSION(1, 0, 4)
+	if (gs_app_get_bundle_kind (app) == AS_BUNDLE_KIND_SYSUPDATE) {
+		gs_app_set_management_plugin (app, plugin);
+	}
+#endif
+}
+
+static void
+gs_plugin_systemd_sysupdate_class_init (GsPluginSystemdSysupdateClass *klass)
+{
+	GObjectClass *object_class = G_OBJECT_CLASS (klass);
+	GsPluginClass *plugin_class = GS_PLUGIN_CLASS (klass);
+
+	object_class->dispose = gs_plugin_systemd_sysupdate_dispose;
+	object_class->finalize = gs_plugin_systemd_sysupdate_finalize;
+
+	plugin_class->setup_async = gs_plugin_systemd_sysupdate_setup_async;
+	plugin_class->setup_finish = gs_plugin_systemd_sysupdate_setup_finish;
+	plugin_class->adopt_app = gs_plugin_systemd_sysupdate_adopt_app;
+	plugin_class->refine_async = gs_plugin_systemd_sysupdate_refine_async;
+	plugin_class->refine_finish = gs_plugin_systemd_sysupdate_refine_finish;
+	plugin_class->list_apps_async = gs_plugin_systemd_sysupdate_list_apps_async;
+	plugin_class->list_apps_finish = gs_plugin_systemd_sysupdate_list_apps_finish;
+	plugin_class->refresh_metadata_async = gs_plugin_systemd_sysupdate_refresh_metadata_async;
+	plugin_class->refresh_metadata_finish = gs_plugin_systemd_sysupdate_refresh_metadata_finish;
+	plugin_class->update_apps_async = gs_plugin_systemd_sysupdate_update_apps_async;
+	plugin_class->update_apps_finish = gs_plugin_systemd_sysupdate_update_apps_finish;
+	plugin_class->install_apps_async = gs_plugin_systemd_sysupdate_install_apps_async;
+	plugin_class->install_apps_finish = gs_plugin_systemd_sysupdate_install_apps_finish;
+	plugin_class->download_upgrade_async = gs_plugin_systemd_sysupdate_download_upgrade_async;
+	plugin_class->download_upgrade_finish = gs_plugin_systemd_sysupdate_download_upgrade_finish;
+	plugin_class->trigger_upgrade_async = gs_plugin_systemd_sysupdate_trigger_upgrade_async;
+	plugin_class->trigger_upgrade_finish = gs_plugin_systemd_sysupdate_trigger_upgrade_finish;
+}
+
+GType
+gs_plugin_query_type (void)
+{
+	return GS_TYPE_PLUGIN_SYSTEMD_SYSUPDATE;
+}
+
